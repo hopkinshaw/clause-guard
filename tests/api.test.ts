@@ -13,7 +13,11 @@ after(() => {
   if (originalBase === undefined) delete process.env.OPENAI_BASE_URL; else process.env.OPENAI_BASE_URL = originalBase;
 });
 
-const jsonRequest = (body: unknown) => new Request("http://localhost/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const jsonRequest = (body: unknown, uiLanguage = "en") => new Request("http://localhost/api/analyze", {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "X-UI-Language": uiLanguage },
+  body: JSON.stringify(body),
+});
 const fileRequest = (name: string, text: string | Uint8Array) => {
   const form = new FormData();
   form.append("file", new File([typeof text === "string" ? text : new Uint8Array(text)], name));
@@ -36,7 +40,7 @@ test("analysis reports missing configuration without returning the sample as rea
 test("analysis recovers from provider output failures while preserving quote verification", async () => {
   type ProviderReply = { text: string; status?: "completed" | "incomplete"; reason?: string; refusal?: boolean };
   const replies: ProviderReply[] = [];
-  const requests: { store: boolean; text: { format: { strict: boolean; type: string } }; input: string; max_output_tokens: number }[] = [];
+  const requests: { store: boolean; text: { format: { strict: boolean; type: string } }; input: string; max_output_tokens: number; instructions: string }[] = [];
 
   const server = createServer(async (req, res) => {
     let body = "";
@@ -62,8 +66,8 @@ test("analysis recovers from provider output failures while preserving quote ver
   assert.ok(address && typeof address !== "string");
   process.env.OPENAI_API_KEY = "test-key";
   process.env.OPENAI_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
-  const run = (body = { contractText: demoContract, role: "Designer", pricing: "$500 fixed", clientContext: "Client is rushing the signature; more pages may be needed." }) =>
-    analyze(jsonRequest(body));
+  const run = (body = { contractText: demoContract, role: "Designer", pricing: "$500 fixed", clientContext: "Client is rushing the signature; more pages may be needed." }, uiLanguage?: string) =>
+    analyze(jsonRequest(body, uiLanguage));
 
   try {
     replies.push({ text: JSON.stringify(demoAnalysis) });
@@ -81,7 +85,7 @@ test("analysis recovers from provider output failures while preserving quote ver
     const literalQuote = "甲方应在验收通过后\n  九十日内支付合同价款。";
     const zhContract = "服务合同。".repeat(16) + literalQuote;
     const zhReport = {
-      riskLevel: " high ",
+      riskLevel: " 高风险 ",
       summary: "  验收时间不明确会拖延回款。  ",
       redFlags: [
         { quote: "「甲方应在验收通过后 九十日内支付合同价款。」", plainEnglish: "客户可能拖着不验收。", suggestedRedline: "甲方应在交付后十四日内支付无争议款项。" },
@@ -90,7 +94,7 @@ test("analysis recovers from provider output failures while preserving quote ver
       emailReplies: { politeNegotiation: "您好，我们可以讨论付款条款吗？", firmDecline: "  " },
     };
     replies.push({ text: "\x60\x60\x60json\n" + JSON.stringify(zhReport) + "\n\x60\x60\x60" });
-    const recovered = await run({ contractText: zhContract, role: "设计师", pricing: "500元", clientContext: "客户催签，可能加页" });
+    const recovered = await run({ contractText: zhContract, role: "设计师", pricing: "500元", clientContext: "" });
     assert.equal(recovered.status, 200);
     const partial = await recovered.json();
     assert.equal(partial.riskLevel, "HIGH");
@@ -102,14 +106,35 @@ test("analysis recovers from provider output failures while preserving quote ver
     assert.match(partial.emailReplies.upsellPricing, /单独报价/);
     assert.match(partial.emailReplies.firmDecline, /暂时无法/);
     assert.equal(requests.length, 2);
+    assert.match(requests[1].instructions, /Report language: natural Chinese/);
 
+    const englishQuote = demoAnalysis.redFlags[0].quote;
+    const localizedReport = {
+      ...zhReport,
+      redFlags: [{ ...zhReport.redFlags[0], quote: englishQuote, clauseTitle: "Payment risk" }],
+      emailReplies: { ...zhReport.emailReplies, upsellPricing: "Hello, let's discuss extra scope." },
+    };
+    const beforeLocalized = requests.length;
+    replies.push({ text: JSON.stringify(demoAnalysis) }, { text: JSON.stringify(localizedReport) });
+    const localized = await run(undefined, "zh-CN");
+    assert.equal(localized.status, 200);
+    const localizedBody = await localized.json();
+    assert.equal(localizedBody.redFlags[0].quote, englishQuote);
+    assert.equal(localizedBody.redFlags[0].clauseTitle, "合同条款");
+    assert.match(localizedBody.emailReplies.upsellPricing, /单独报价/);
+    assert.equal(requests.length, beforeLocalized + 2);
+    assert.match(requests[beforeLocalized].instructions, /Report language: natural Chinese/);
+
+    const beforeTruncation = requests.length;
     replies.push(
       { text: '{"summary":', status: "incomplete", reason: "max_output_tokens" },
       { text: JSON.stringify(demoAnalysis) },
     );
     const retried = await run();
     assert.equal(retried.status, 200);
-    assert.ok(requests[3].max_output_tokens > requests[2].max_output_tokens);
+    const compactRetry = requests[beforeTruncation + 1];
+    assert.ok(compactRetry.max_output_tokens > requests[beforeTruncation].max_output_tokens);
+    assert.match(compactRetry.instructions, /at most three/);
 
     const allFabricated = { ...demoAnalysis, redFlags: [{ ...demoAnalysis.redFlags[0], quote: "This clause does not exist in the contract." }] };
     replies.push({ text: JSON.stringify(allFabricated) }, { text: JSON.stringify(allFabricated) });
@@ -119,7 +144,7 @@ test("analysis recovers from provider output failures while preserving quote ver
 
     replies.push({ text: "{invalid", refusal: true });
     assert.equal((await run()).status, 422);
-    assert.equal(requests.length, 7);
+    assert.equal(requests.length, 9);
     assert.equal(replies.length, 0);
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
 });

@@ -65,7 +65,11 @@ export default function Home() {
   async function analyze(event: React.FormEvent) {
     event.preventDefault(); setBusy(true); setError("");
     try {
-      const res = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contractText: text, role, pricing, clientContext: context }) });
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-UI-Language": document.documentElement.lang },
+        body: JSON.stringify({ contractText: text, role, pricing, clientContext: context }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Analysis failed. Please try again.");
       setReport(analysisSchema.parse(data)); setIsDemo(false);

@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { analysisSchema, inputSchema } from "@/lib/analysis";
-import { analysisInstructions, verifyReport } from "./report";
+import { analysisInstructions, requiresChineseReport, verifyReport } from "./report";
 
 export const runtime = "nodejs";
 export const maxDuration = 90;
@@ -25,6 +25,10 @@ export async function POST(request: Request) {
   if (!input.success) return Response.json({ error: input.error.issues[0]?.message ?? "Invalid input." }, { status: 400 });
   if (!process.env.OPENAI_API_KEY) return Response.json({ error: "Analysis is not configured yet. Add OPENAI_API_KEY to the server environment. You can still explore the sample report." }, { status: 503 });
 
+  const chineseReport = requiresChineseReport(input.data.contractText, input.data.clientContext, request.headers.get("x-ui-language"));
+  const instructions = chineseReport
+    ? analysisInstructions + "\n\nReport language: natural Chinese for all generated prose. Keep each quote exactly as it appears in the source."
+    : analysisInstructions;
   try {
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
     const deadline = performance.now() + ANALYSIS_BUDGET_MS;
@@ -44,8 +48,8 @@ export async function POST(request: Request) {
         ...params,
         max_output_tokens: retryReason === "truncated" ? TRUNCATION_RETRY_TOKENS : INITIAL_OUTPUT_TOKENS,
         instructions: retryReason
-          ? analysisInstructions + "\n\nRegenerate a complete report within the output budget. Prioritize the most material risks, quote shorter continuous passages, and keep every explanation and reply concise."
-          : analysisInstructions,
+          ? instructions + "\n\nRegenerate a complete JSON report. Use at most three of the most material risks and short continuous verbatim quotes. Keep the summary and drafts concise. Preserve every essential protection in each selected replacement clause and use the required language throughout."
+          : instructions,
       }, { timeout: Math.min(75_000, remainingMs), signal: request.signal });
 
       const refused = response.output.some(item =>
@@ -61,7 +65,7 @@ export async function POST(request: Request) {
       if (response.status !== "completed") {
         return Response.json({ error: "The AI service did not complete the analysis. Please try again." }, { status: 502 });
       }
-      const report = verifyReport(response.output_text, input.data.contractText);
+      const report = verifyReport(response.output_text, input.data.contractText, chineseReport);
       if (report) return Response.json(report, { headers: { "Cache-Control": "no-store" } });
       retryReason = "unverifiable";
     }
