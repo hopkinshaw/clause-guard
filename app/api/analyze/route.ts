@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { analysisSchema, inputSchema } from "@/lib/analysis";
-import { analysisInstructions, requiresChineseReport, verifyReport } from "./report";
+import { analysisInstructions, isPrimarilyChinese, requiresChineseReport, verifyReport } from "./report";
 
 export const runtime = "nodejs";
 export const maxDuration = 90;
@@ -66,7 +66,11 @@ export async function POST(request: Request) {
         return Response.json({ error: "The AI service did not complete the analysis. Please try again." }, { status: 502 });
       }
       const report = verifyReport(response.output_text, input.data.contractText, chineseReport);
-      if (report) return Response.json(report, { headers: { "Cache-Control": "no-store" } });
+      if (report) {
+        const headers = new Headers({ "Cache-Control": "no-store" });
+        if (chineseReport || isPrimarilyChinese(report.summary)) headers.set("Content-Language", "zh");
+        return Response.json(report, { headers });
+      }
       retryReason = "unverifiable";
     }
 

@@ -97,6 +97,7 @@ test("analysis recovers from provider output failures while preserving quote ver
     replies.push({ text: "\x60\x60\x60json\n" + JSON.stringify(zhReport) + "\n\x60\x60\x60" });
     const recovered = await run({ contractText: zhContract, role: "设计师", pricing: "500元", clientContext: "" });
     assert.equal(recovered.status, 200);
+    assert.equal(recovered.headers.get("content-language"), "zh");
     const partial = await recovered.json();
     assert.equal(partial.riskLevel, "HIGH");
     assert.match(partial.summary, /未列入报告/);
@@ -157,7 +158,7 @@ test("duplicate action drafts use strategy-specific fallbacks without replacing 
     redFlags: [],
     emailReplies: {
       politeNegotiation: "您好，请修改付款条款。",
-      upsellPricing: "您好，\n请修改付款条款！",
+      upsellPricing: "你好，\n请修改付款条款！",
       firmDecline: "谢谢您的邀请。按现有条款，我决定婉拒这个项目。",
     },
   };
@@ -167,6 +168,12 @@ test("duplicate action drafts use strategy-specific fallbacks without replacing 
   assert.match(report.emailReplies.upsellPricing, /单独报价.*费用和排期/);
   assert.equal(report.emailReplies.firmDecline, draft.emailReplies.firmDecline);
   assert.equal(new Set(Object.values(report.emailReplies)).size, 3);
+
+  const misplaced = verifyReport(JSON.stringify({
+    ...draft,
+    emailReplies: { ...draft.emailReplies, politeNegotiation: "", upsellPricing: report.emailReplies.politeNegotiation },
+  }), demoContract, true);
+  assert.deepEqual(misplaced?.emailReplies, report.emailReplies);
 });
 
 test("quote matching tolerates whitespace while requiring real excerpts", () => {
