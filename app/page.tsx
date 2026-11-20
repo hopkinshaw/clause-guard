@@ -93,7 +93,7 @@ export default function Home() {
   return <div className="min-h-screen">
     <header className="site-header"><div className="header-inner"><a className="brand" href="/" aria-label="ClauseGuard home"><span className="brand-icon"><ShieldCheck size={23} strokeWidth={1.8} /></span>Clause<span className="brand-light">Guard</span><span className="beta">BETA</span></a><div className="header-note"><span className="header-line" />Independent work. Better protected.</div><a className="header-link" href="#how-it-works">How it works <ArrowUpRight size={15} /></a></div></header>
     <main className="page-shell">
-      <section className="hero"><div className="eyebrow"><span /> YOUR CONTRACT, DECODED</div><h1>Your work. <span>Your terms.</span></h1><p>Spot the red flags before you sign.<br className="mobile-break" /> Turn tricky contract terms into a confident reply.</p><div className="hero-benefits"><span><CheckCheck size={15} /> Built for freelancers</span><span><LockKeyhole size={14} /> No account needed</span><span><Sparkles size={14} /> {reportLabel("Plain language, always", "始终用通俗语言")}</span></div></section>
+      <section className="hero"><div className="eyebrow"><span /> YOUR CONTRACT, DECODED</div><h1>你的合同，<span>你做主。</span></h1><p>Spot the red flags before you sign.<br className="mobile-break" /> Turn tricky contract terms into a confident reply.</p><div className="hero-benefits"><span><CheckCheck size={15} /> Built for freelancers</span><span><LockKeyhole size={14} /> No account needed</span><span><Sparkles size={14} /> {reportLabel("Plain language, always", "始终用通俗语言")}</span></div></section>
       <div className="workspace">
         <aside className="input-panel"><form onSubmit={analyze}>
           <div className="panel-heading"><span className="section-icon"><FileText size={19} /></span><div><h2>Your contract</h2><p>A little clarity before a big commitment.</p></div></div>
@@ -109,7 +109,7 @@ export default function Home() {
           <fieldset disabled={busy || extracting} className="context-fields"><div className="two-fields"><div><label htmlFor="role">Your role</label><div className="select-wrap"><select id="role" value={role} onChange={e => setRole(e.target.value)}><option value="">Select your role</option><option>Designer</option><option>Video Editor</option><option>Developer</option><option>Writer</option><option>Consultant</option><option>Other freelancer</option></select><ChevronDown size={14} /></div></div><div><label htmlFor="pricing">Project rate</label><input id="pricing" placeholder="e.g. $40/hr" value={pricing} onChange={e => setPricing(e.target.value)} maxLength={120} /></div></div><label htmlFor="context">Anything we should know?</label><textarea id="context" className="context-text" placeholder={'e.g. “They said it’s just a standard NDA.”'} value={context} onChange={e => setContext(e.target.value)} maxLength={1000} /></fieldset>
           {error && <div className="error-message" role="alert"><AlertTriangle size={17} /><span>{error}</span></div>}
           <button className="analyze-button" type="submit" disabled={busy || extracting || text.trim().length < 80}>{busy ? <LoaderCircle size={18} className="animate-spin" /> : <ScanLine size={19} />}{busy ? "Reviewing the fine print…" : "Analyze my contract"}</button>
-          <p className="privacy-note"><LockKeyhole size={12} /> Sent to OpenAI only when you analyze.<br />Files are processed for text; we don’t store your contract.</p>
+          <p className="privacy-note"><LockKeyhole size={12} /> 仅在点击分析时处理您的合同内容，且不会存储合同文本。</p>
         </form></aside>
         <section
           className={`results-panel ${busy ? "is-loading" : ""}`}
@@ -212,6 +212,6 @@ export default function Home() {
       </div>
       <section id="how-it-works" className="how-it-works"><div><span><Upload size={18} /></span><p><strong>Drop in the fine print</strong><br />Upload a contract or paste the text.</p></div><ChevronRight size={17} className="step-chevron" /><div><span><ScanLine size={18} /></span><p><strong>See what’s at stake</strong><br />Understand the risks, minus the jargon.</p></div><ChevronRight size={17} className="step-chevron" /><div><span><MessageSquareText size={18} /></span><p><strong>Find the right words</strong><br />Copy a reply. Start the conversation.</p></div></section>
     </main>
-    <footer className="site-footer"><div><a className="footer-brand" href="/"><ShieldCheck size={17} />ClauseGuard</a><span>Made for the independently minded.</span></div><p>Disclaimer: ClauseGuard provides AI-powered commercial contract insights for freelancers and does not constitute formal legal advice.</p></footer>
+    <footer className="site-footer"><div><a className="footer-brand" href="/"><ShieldCheck size={17} />ClauseGuard</a><span>Made for the independently minded.</span></div><p>免责声明：ClauseGuard 为自由职业者提供合同风险梳理与条款参考，但不构成正式的法律建议。</p></footer>
   </div>;
 }
