@@ -2,10 +2,17 @@ import type { PoolConfig } from "pg";
 
 const isNeon = (host: string) => host.toLowerCase().endsWith(".neon.tech");
 
+const pooled = ["DATABASE_URL", "POSTGRES_URL"] as const;
+const direct = ["DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING"] as const;
+
+export function postgresSource(env: Record<string, string | undefined> = process.env, preferDirect = false) {
+  const keys = preferDirect ? [...direct, ...pooled] : [...pooled, ...direct];
+  return keys.find(key => env[key]?.trim()) ?? (env.PGHOST?.trim() ? "PGHOST" : null);
+}
+
 export function postgresOptions(env: Record<string, string | undefined> = process.env, preferDirect = false): PoolConfig {
-  const pooled = env.DATABASE_URL?.trim() || env.POSTGRES_URL?.trim();
-  const direct = env.DATABASE_URL_UNPOOLED?.trim() || env.POSTGRES_URL_NON_POOLING?.trim();
-  const connectionString = preferDirect ? direct || pooled : pooled || direct;
+  const source = postgresSource(env, preferDirect);
+  const connectionString = source && source !== "PGHOST" ? env[source]?.trim() : undefined;
 
   if (connectionString) {
     let url: URL;

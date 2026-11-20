@@ -34,8 +34,22 @@ async function transaction<T>(operation: (client: PoolClient) => Promise<T>) {
   }
 }
 
+type CreditSnapshot = {
+  freeLimit: number;
+  walletFreeUsed: number;
+  networkFreeUsed: number | null;
+  networkReservations: number | null;
+  paidRemaining: number;
+  freeRemaining: number;
+  remaining: number;
+};
+
 export class AnalysisLimit extends Error {
-  constructor(readonly code: "NO_CREDITS" | "ANALYSIS_IN_PROGRESS" | "DAILY_LIMIT" | "FREE_DAILY_LIMIT") {
+  constructor(
+    readonly code: "NO_CREDITS" | "ANALYSIS_IN_PROGRESS" | "DAILY_LIMIT" | "FREE_DAILY_LIMIT",
+    readonly reason: string,
+    readonly quota: CreditSnapshot,
+  ) {
     super(code);
   }
 }
@@ -81,12 +95,26 @@ export async function billingStatus(wallet: string, network: string | null, conf
 export async function reserveAnalysis(wallet: string, network: string | null, config: BillingConfig) {
   return transaction(async client => {
     await client.query(insertWallet, [wallet]);
-    const { rows: [balance] } = await client.query<{ free_used: number; paid_balance: number }>(
-      "SELECT free_used, paid_balance FROM billing_wallets WHERE id = $1 FOR UPDATE", [wallet],
-    );
+    const { rows: [balance] } = await client.query<{ free_used: number; paid_balance: number; network_free_used: number }>(`
+      SELECT w.free_used, w.paid_balance, COALESCE(n.free_used, 0) AS network_free_used
+      FROM billing_wallets w
+      LEFT JOIN billing_networks n ON n.id = $2
+      WHERE w.id = $1 FOR UPDATE OF w
+    `, [wallet, network]);
+    let networkFreeUsed = network ? balance.network_free_used : null;
+    let networkReservations: number | null = null;
+    const snapshot = (): CreditSnapshot => {
+      const freeRemaining = networkFreeUsed === null ? 0 : Math.max(
+        0, config.free - Math.max(balance.free_used, networkFreeUsed + (networkReservations ?? 0)),
+      );
+      return {
+        freeLimit: config.free, walletFreeUsed: balance.free_used, networkFreeUsed, networkReservations,
+        paidRemaining: balance.paid_balance, freeRemaining, remaining: freeRemaining + balance.paid_balance,
+      };
+    };
     await client.query("DELETE FROM billing_reservations WHERE wallet_id = $1 AND expires_at <= now()", [wallet]);
     if ((await client.query("SELECT 1 FROM billing_reservations WHERE wallet_id = $1", [wallet])).rowCount) {
-      throw new AnalysisLimit("ANALYSIS_IN_PROGRESS");
+      throw new AnalysisLimit("ANALYSIS_IN_PROGRESS", "wallet_reservation_active", snapshot());
     }
 
     let freeNetwork: string | null = null;
@@ -98,18 +126,28 @@ export async function reserveAnalysis(wallet: string, network: string | null, co
       const { rows: [active] } = await client.query<{ count: number }>(
         "SELECT COUNT(*)::int AS count FROM billing_reservations WHERE network_id = $1 AND expires_at > now()", [network],
       );
+      networkFreeUsed = bucket.free_used;
+      networkReservations = active.count;
       if (bucket.free_used + active.count < config.free) freeNetwork = network;
     }
-    if (!freeNetwork && balance.paid_balance === 0) throw new AnalysisLimit("NO_CREDITS");
+    const quota = snapshot();
+    if (!freeNetwork && balance.paid_balance === 0) {
+      const reason = config.free === 0 ? "free_disabled"
+        : !network ? "network_unavailable"
+        : balance.free_used >= config.free ? "wallet_free_limit"
+        : (networkFreeUsed ?? 0) >= config.free ? "network_free_limit"
+        : "network_reservations_active";
+      throw new AnalysisLimit("NO_CREDITS", reason, quota);
+    }
 
     const today = "(now() AT TIME ZONE 'UTC')::date";
     await client.query(`INSERT INTO billing_daily (day) VALUES (${today}) ON CONFLICT DO NOTHING`);
     const { rows: [daily] } = await client.query<{ attempts: number; free_attempts: number }>(
       `SELECT attempts, free_attempts FROM billing_daily WHERE day = ${today} FOR UPDATE`,
     );
-    if (daily.attempts >= config.daily) throw new AnalysisLimit("DAILY_LIMIT");
+    if (daily.attempts >= config.daily) throw new AnalysisLimit("DAILY_LIMIT", "daily_limit", quota);
     if (freeNetwork && daily.free_attempts >= config.freeDaily) {
-      throw new AnalysisLimit("FREE_DAILY_LIMIT");
+      throw new AnalysisLimit("FREE_DAILY_LIMIT", "free_daily_limit", quota);
     }
 
     const id = randomUUID();
@@ -121,33 +159,36 @@ export async function reserveAnalysis(wallet: string, network: string | null, co
       `UPDATE billing_daily SET attempts = attempts + 1, free_attempts = free_attempts + $1 WHERE day = ${today}`,
       [freeNetwork ? 1 : 0],
     );
-    return id;
+    return { id, source: freeNetwork ? "free" as const : "paid" as const, quota };
   });
 }
 
 export async function completeAnalysis(wallet: string, id: string) {
-  await transaction(async client => {
+  return transaction(async client => {
     await client.query("SELECT id FROM billing_wallets WHERE id = $1 FOR UPDATE", [wallet]);
     const { rows: [hold] } = await client.query<{ network_id: string | null }>(
       "SELECT network_id FROM billing_reservations WHERE wallet_id = $1 AND id = $2 AND expires_at > now() FOR UPDATE", [wallet, id],
     );
     if (!hold) throw new Error("Analysis reservation is no longer valid");
     if (hold.network_id) {
-      await client.query("UPDATE billing_networks SET free_used = free_used + 1 WHERE id = $1", [hold.network_id]);
-      await client.query("UPDATE billing_wallets SET free_used = free_used + 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1", [wallet]);
-    } else {
-      const deducted = await client.query(
-        "UPDATE billing_wallets SET paid_balance = paid_balance - 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1 AND paid_balance > 0",
-        [wallet],
-      );
-      if (deducted.rowCount !== 1) throw new Error("Reserved paid credit is no longer available");
+      const network = await client.query("UPDATE billing_networks SET free_used = free_used + 1 WHERE id = $1", [hold.network_id]);
+      if (network.rowCount !== 1) throw new Error("Reserved free network no longer exists");
     }
+    const walletUpdate = hold.network_id
+      ? "UPDATE billing_wallets SET free_used = free_used + 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1"
+      : "UPDATE billing_wallets SET paid_balance = paid_balance - 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1 AND paid_balance > 0";
+    const { rows: [charged] } = await client.query<{ free_used: number; paid_balance: number; used_analyses: string }>(
+      walletUpdate + " RETURNING free_used, paid_balance, used_analyses", [wallet],
+    );
+    if (!charged) throw new Error("Reserved credit is no longer available");
     await client.query("DELETE FROM billing_reservations WHERE id = $1", [id]);
+    return { walletFreeUsed: charged.free_used, paidRemaining: charged.paid_balance, used: Number(charged.used_analyses) };
   });
 }
 
 export async function releaseAnalysis(wallet: string, id: string) {
-  await db().query("DELETE FROM billing_reservations WHERE wallet_id = $1 AND id = $2", [wallet, id]);
+  const released = await db().query("DELETE FROM billing_reservations WHERE wallet_id = $1 AND id = $2", [wallet, id]);
+  return released.rowCount === 1;
 }
 
 export async function savePurchase(session: string, wallet: string, pack: Pack) {

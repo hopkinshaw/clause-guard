@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { analysisSchema, inputSchema } from "@/lib/analysis";
+import { billingAudit, billingErrorCode, billingRef } from "@/lib/billing/audit";
 import { billingConfig } from "@/lib/billing/config";
 import { networkFromRequest, walletFromRequest } from "@/lib/billing/identity";
 import { AnalysisLimit, completeAnalysis, releaseAnalysis, reserveAnalysis } from "@/lib/billing/store";
@@ -26,32 +27,49 @@ export async function POST(request: Request) {
   }
   const input = inputSchema.safeParse(body);
   if (!input.success) return Response.json({ error: input.error.issues[0]?.message ?? "Invalid input." }, { status: 400 });
-  if (!process.env.OPENAI_API_KEY) return Response.json({ error: "Analysis is not configured yet. Add OPENAI_API_KEY to the server environment. You can still explore the sample report." }, { status: 503 });
+  const audit = billingAudit("analyze");
+  const reply = (payload: unknown, status = 200, headers?: Record<string, string>) =>
+    Response.json(payload, { status, headers: { ...audit.headers, ...headers } });
+  if (!process.env.OPENAI_API_KEY) {
+    audit.log("error", "blocked", { reason: "model_not_configured" });
+    return reply({ error: "Analysis is not configured yet. Add OPENAI_API_KEY to the server environment. You can still explore the sample report." }, 503);
+  }
 
   let config: ReturnType<typeof billingConfig> | undefined;
   let wallet: string | null = null;
-  let reservation: string | undefined;
+  let network: string | null = null;
+  let reservation: Awaited<ReturnType<typeof reserveAnalysis>> | undefined;
+  const refs = () => ({
+    walletRef: billingRef(wallet),
+    networkRef: billingRef(network),
+    reservationRef: billingRef(reservation?.id),
+  });
   try {
     config = billingConfig(request);
     const origin = request.headers.get("origin");
     if (origin && origin !== config.app.origin) {
-      return Response.json({ error: "Open analysis from the main ClauseGuard site." }, { status: 403 });
+      audit.log("warn", "blocked", { reason: "origin_mismatch" });
+      return reply({ error: "Open analysis from the main ClauseGuard site." }, 403);
     }
     wallet = walletFromRequest(request, config);
     if (!wallet) {
-      return Response.json({ error: "Refresh the page to start a credit session.", code: "BILLING_SESSION_REQUIRED" }, { status: 428 });
+      audit.log("warn", "blocked", { reason: "wallet_cookie_missing_or_invalid" });
+      return reply({ error: "Refresh the page to start a credit session.", code: "BILLING_SESSION_REQUIRED" }, 428);
     }
-    reservation = await reserveAnalysis(wallet, networkFromRequest(request, config), config);
+    network = networkFromRequest(request, config);
+    reservation = await reserveAnalysis(wallet, network, config);
+    audit.log("warn", "authorized", { ...refs(), source: reservation.source, quota: reservation.quota });
   } catch (error) {
     if (error instanceof AnalysisLimit) {
+      audit.log("warn", "blocked", { ...refs(), code: error.code, reason: error.reason, quota: error.quota });
       if (error.code === "NO_CREDITS") {
-        return Response.json({
+        return reply({
           status: "needs_credits",
           code: "NO_CREDITS",
           remaining: 0,
           message: "You’ve used all your available analyses.",
           checkout: config?.checkoutEnabled ? { endpoint: "/api/billing/checkout", packs: config.packs } : null,
-        }, { headers: { "Cache-Control": "no-store" } });
+        });
       }
       const details = {
         ANALYSIS_IN_PROGRESS: [409, "An analysis is already in progress. Please wait for it to finish."],
@@ -59,9 +77,12 @@ export async function POST(request: Request) {
         FREE_DAILY_LIMIT: [429, "Today’s free analysis limit has been reached. Buy credits or try again tomorrow (UTC)."],
       } as const;
       const [status, message] = details[error.code];
-      return Response.json({ error: message, code: error.code }, { status });
+      return reply({ error: message, code: error.code }, status);
     }
-    return Response.json({ error: "Credit validation is temporarily unavailable." }, { status: 503 });
+    audit.log("error", "validation_failed", {
+      ...refs(), stage: config ? "reserve" : "configuration", errorCode: billingErrorCode(error),
+    });
+    return reply({ error: "Credit validation is temporarily unavailable." }, 503);
   }
 
   try {
@@ -91,25 +112,31 @@ export async function POST(request: Request) {
         item.type === "message" && item.content.some(part => part.type === "refusal"),
       );
       if (refused || response.incomplete_details?.reason === "content_filter") {
-        return Response.json({ error: "The AI could not analyze this text. Try a focused excerpt of the contract." }, { status: 422 });
+        return reply({ error: "The AI could not analyze this text. Try a focused excerpt of the contract." }, 422);
       }
       if (response.status === "incomplete" && response.incomplete_details?.reason === "max_output_tokens") {
         retryReason = "truncated";
         continue;
       }
       if (response.status !== "completed") {
-        return Response.json({ error: "The AI service did not complete the analysis. Please try again." }, { status: 502 });
+        return reply({ error: "The AI service did not complete the analysis. Please try again." }, 502);
       }
       const report = verifyReport(response.output_text, input.data.contractText);
       if (report) {
         if (request.signal.aborted) break;
+        const held = reservation;
         try {
-          await completeAnalysis(wallet, reservation);
+          const charged = await completeAnalysis(wallet, held.id);
+          audit.log("warn", "charged", {
+            ...refs(), source: held.source, ...charged,
+            walletFreeRemaining: Math.max(0, (config?.free ?? 0) - charged.walletFreeUsed),
+          });
           reservation = undefined;
-        } catch {
-          return Response.json({ error: "Could not confirm the analysis credit. Please refresh and check your balance." }, { status: 503 });
+        } catch (error) {
+          audit.log("error", "charge_failed", { ...refs(), source: held.source, errorCode: billingErrorCode(error) });
+          return reply({ error: "Could not confirm the analysis credit. Please refresh and check your balance." }, 503);
         }
-        return Response.json(report, { headers: { "Cache-Control": "no-store", "Content-Language": "en" } });
+        return reply(report, 200, { "Content-Language": "en" });
       }
       retryReason = "unverifiable";
     }
@@ -117,17 +144,20 @@ export async function POST(request: Request) {
     const error = retryReason === "truncated"
       ? "The analysis was cut off. Try a shorter excerpt of the contract."
       : "The AI could not produce a verifiable report. Try again or use a more focused contract excerpt.";
-    return Response.json({ error }, { status: 502 });
+    return reply({ error }, 502);
   } catch (error) {
-    if (error instanceof OpenAI.APIError && error.status === 429) return Response.json({ error: "The AI service is busy or its quota has been reached. Please try again later." }, { status: 429 });
-    if (error instanceof OpenAI.APIError && error.code === "context_length_exceeded") return Response.json({ error: "This contract is too long for the configured model. Try a shorter excerpt." }, { status: 413 });
-    if (error instanceof OpenAI.APIConnectionTimeoutError) return Response.json({ error: "Analysis timed out. Please try again with a shorter contract." }, { status: 504 });
-    return Response.json({ error: "Analysis is temporarily unavailable. Please try again later." }, { status: 502 });
+    if (error instanceof OpenAI.APIError && error.status === 429) return reply({ error: "The AI service is busy or its quota has been reached. Please try again later." }, 429);
+    if (error instanceof OpenAI.APIError && error.code === "context_length_exceeded") return reply({ error: "This contract is too long for the configured model. Try a shorter excerpt." }, 413);
+    if (error instanceof OpenAI.APIConnectionTimeoutError) return reply({ error: "Analysis timed out. Please try again with a shorter contract." }, 504);
+    return reply({ error: "Analysis is temporarily unavailable. Please try again later." }, 502);
   } finally {
     if (reservation) {
-      await releaseAnalysis(wallet, reservation).catch(() => {
-        console.error("Could not release an analysis reservation; it will expire.");
-      });
+      try {
+        const released = await releaseAnalysis(wallet, reservation.id);
+        audit.log("warn", "analysis_not_charged", { ...refs(), released, aborted: request.signal.aborted });
+      } catch (error) {
+        audit.log("error", "release_failed", { ...refs(), errorCode: billingErrorCode(error) });
+      }
     }
   }
 }

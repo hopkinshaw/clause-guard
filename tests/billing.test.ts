@@ -9,6 +9,7 @@ import { GET as status } from "../app/api/billing/status/route";
 import { POST as webhook } from "../app/api/billing/webhook/route";
 import { POST as analyze } from "../app/api/analyze/route";
 import { demoAnalysis, demoContract } from "../lib/demo";
+import { billingRef } from "../lib/billing/audit";
 import { billingConfig } from "../lib/billing/config";
 import { postgresOptions } from "../lib/billing/database";
 import { networkFromRequest, newWallet, walletCookie, walletFromRequest } from "../lib/billing/identity";
@@ -158,16 +159,16 @@ test("reservations serialize per wallet and per network, and only a completed re
   assert.equal(won.status, "fulfilled");
   assert.equal(lost.status, "rejected");
   assert.ok(lost.reason instanceof AnalysisLimit && lost.reason.code === "NO_CREDITS");
-  await completeAnalysis(winner === 0 ? other : stranger, won.value);
+  await completeAnalysis(winner === 0 ? other : stranger, won.value.id);
 
-  await releaseAnalysis(wallet, first);
+  await releaseAnalysis(wallet, first.id);
   assert.equal((await billingStatus(wallet, network, config)).remaining, 1);
   const retry = await reserveAnalysis(wallet, network, config);
-  await completeAnalysis(wallet, retry);
+  await completeAnalysis(wallet, retry.id);
   await assert.rejects(reserveAnalysis(newWallet(), network, config), { code: "NO_CREDITS" });
 
   const leased = await reserveAnalysis(wallet, "different-test-network", config);
-  await completeAnalysis(wallet, leased);
+  await completeAnalysis(wallet, leased.id);
   await assert.rejects(reserveAnalysis(wallet, "third-test-network", config), { code: "NO_CREDITS" });
   await assert.rejects(reserveAnalysis(newWallet(), "fourth-test-network", { ...config, freeDaily: 0 }), { code: "FREE_DAILY_LIMIT" });
   await assert.rejects(reserveAnalysis(newWallet(), "fifth-test-network", { ...config, daily: 0 }), { code: "DAILY_LIMIT" });
@@ -183,18 +184,24 @@ test("a paid reservation is used before free credits and a released reservation 
   assert.equal(await creditPurchase(session, wallet, pack.id, pack.amount), true);
 
   const released = await reserveAnalysis(wallet, network, config);
-  await releaseAnalysis(wallet, released);
+  await releaseAnalysis(wallet, released.id);
   const unchanged = await billingStatus(wallet, network, config);
   assert.deepEqual([unchanged.free, unchanged.paid, unchanged.used], [2, pack.credits, 0]);
 
   const spent = await reserveAnalysis(wallet, network, config);
-  await completeAnalysis(wallet, spent);
-  await assert.rejects(completeAnalysis(wallet, spent), /reservation is no longer valid/);
+  await completeAnalysis(wallet, spent.id);
+  await assert.rejects(completeAnalysis(wallet, spent.id), /reservation is no longer valid/);
   const afterSpend = await billingStatus(wallet, network, config);
   assert.deepEqual([afterSpend.free, afterSpend.paid, afterSpend.used], [2, pack.credits - 1, 1]);
 });
 
 test("two analyses, quota block, and verified Stripe payment restore credits on the same wallet", { skip: !testDatabase }, async t => {
+  const logs: Array<{ event: string; fields: Record<string, unknown> }> = [];
+  for (const level of ["info", "warn", "error"] as const) {
+    t.mock.method(console, level, (event: string, detail: string) => {
+      logs.push({ event, fields: JSON.parse(detail) });
+    });
+  }
   process.env.STRIPE_SECRET_KEY = "sk_test_" + randomBytes(16).toString("hex");
   const webhookSecret = "whsec_" + randomBytes(16).toString("hex");
   process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
@@ -250,6 +257,15 @@ test("two analyses, quota block, and verified Stripe payment restore credits on 
   const blocked = await runAnalysis();
   assert.equal(blocked.status, 200);
   assert.equal(blocked.headers.get("cache-control"), "no-store");
+  const blockedLog = logs.find(log => log.fields.requestId === blocked.headers.get("x-billing-request-id"));
+  assert.equal(blockedLog?.event, "[billing.analyze] blocked");
+  assert.equal(blockedLog?.fields.walletRef, billingRef(wallet));
+  assert.equal(blockedLog?.fields.reason, "wallet_free_limit");
+  assert.equal((blockedLog?.fields.quota as { remaining: number }).remaining, 0);
+  assert.ok(logs.some(log => log.event === "[billing.status] wallet_created" && log.fields.walletRef === billingRef(wallet)));
+  const walletLogs = logs.filter(log => log.event === "[billing.analyze] charged" && log.fields.walletRef === billingRef(wallet));
+  assert.deepEqual(walletLogs.map(log => log.fields.walletFreeUsed), [1, 2]);
+  assert.ok(!JSON.stringify(logs).includes(cookie) && !JSON.stringify(logs).includes(wallet));
   assert.deepEqual(await blocked.json(), {
     status: "needs_credits",
     code: "NO_CREDITS",
@@ -322,4 +338,39 @@ test("two analyses, quota block, and verified Stripe payment restore credits on 
   assert.equal(modelCalls, 3);
   const afterSpend = await read();
   assert.deepEqual([afterSpend.paid, afterSpend.used, afterSpend.purchased], [4, 3, 5]);
+
+  const ledger = new Pool({ connectionString: process.env.DATABASE_URL, max: 1 });
+  try {
+    const sql = await readFile(new URL("../db/inspect-billing.sql", import.meta.url), "utf8");
+    const { rows: [inspection] } = await ledger.query(sql);
+    assert.ok(inspection.billing_audit.billing_wallets.recent.some(
+      (row: { wallet_ref: string }) => row.wallet_ref === billingRef(wallet),
+    ));
+    assert.equal(inspection.billing_audit.billing_reservations.active, 0);
+
+    await ledger.query("ALTER TABLE billing_reservations RENAME TO audit_hidden_reservations");
+    try {
+      const unavailable = await runAnalysis();
+      assert.equal(unavailable.status, 503);
+      assert.equal(modelCalls, 3);
+      assert.ok(logs.some(log => log.event === "[billing.analyze] validation_failed" && log.fields.errorCode === "42P01"));
+    } finally {
+      await ledger.query("ALTER TABLE audit_hidden_reservations RENAME TO billing_reservations");
+    }
+
+    await ledger.query("ALTER TABLE billing_wallets ADD CONSTRAINT audit_reject_charge CHECK (used_analyses < 4) NOT VALID");
+    try {
+      const failedCharge = await runAnalysis();
+      assert.equal(failedCharge.status, 503);
+      assert.equal(modelCalls, 4);
+      assert.equal((await failedCharge.json()).riskLevel, undefined);
+      assert.equal((await read()).paid, 4);
+      assert.ok(logs.some(log => log.event === "[billing.analyze] charge_failed" && log.fields.errorCode === "23514"));
+      assert.ok(logs.some(log => log.event === "[billing.analyze] analysis_not_charged" && log.fields.released === true));
+    } finally {
+      await ledger.query("ALTER TABLE billing_wallets DROP CONSTRAINT audit_reject_charge");
+    }
+  } finally {
+    await ledger.end();
+  }
 });
