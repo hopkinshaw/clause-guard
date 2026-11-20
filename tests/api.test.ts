@@ -33,31 +33,94 @@ test("analysis reports missing configuration without returning the sample as rea
   assert.ok((await response.json()).error.includes("OPENAI_API_KEY"));
 });
 
-test("analysis uses strict structured output and rejects fabricated quotes", async () => {
-  let fabricated = false;
+test("analysis recovers from provider output failures while preserving quote verification", async () => {
+  type ProviderReply = { text: string; status?: "completed" | "incomplete"; reason?: string; refusal?: boolean };
+  const replies: ProviderReply[] = [];
+  const requests: { store: boolean; text: { format: { strict: boolean; type: string } }; input: string; max_output_tokens: number }[] = [];
+
   const server = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
-    const request = JSON.parse(body);
-    assert.equal(request.store, false);
-    assert.equal(request.text.format.strict, true);
-    assert.equal(request.text.format.type, "json_schema");
-    const report = structuredClone(demoAnalysis);
-    if (fabricated) report.redFlags[0].quote = "This clause does not exist in the contract.";
+    requests.push(JSON.parse(body));
+    const reply = replies.shift();
+    if (!reply) { res.writeHead(500).end(); return; }
+    const content = reply.refusal
+      ? { type: "refusal", refusal: "Cannot analyze this input." }
+      : { type: "output_text", text: reply.text, annotations: [] };
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ id: "resp_test", object: "response", created_at: 1, status: "completed", output: [{ id: "msg_test", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: JSON.stringify(report), annotations: [] }] }] }));
+    res.end(JSON.stringify({
+      id: "resp_test",
+      object: "response",
+      created_at: 1,
+      status: reply.status ?? "completed",
+      incomplete_details: reply.reason ? { reason: reply.reason } : null,
+      output: [{ id: "msg_test", type: "message", role: "assistant", status: "completed", content: [content] }],
+    }));
   });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   process.env.OPENAI_API_KEY = "test-key";
   process.env.OPENAI_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
+  const run = (body = { contractText: demoContract, role: "Designer", pricing: "$500 fixed", clientContext: "Client is rushing the signature; more pages may be needed." }) =>
+    analyze(jsonRequest(body));
+
   try {
-    const response = await analyze(jsonRequest({ contractText: demoContract, role: "Designer" }));
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), demoAnalysis);
-    fabricated = true;
-    assert.equal((await analyze(jsonRequest({ contractText: demoContract }))).status, 502);
+    replies.push({ text: JSON.stringify(demoAnalysis) });
+    const valid = await run();
+    assert.equal(valid.status, 200);
+    assert.deepEqual(await valid.json(), demoAnalysis);
+    assert.equal(requests[0].store, false);
+    assert.equal(requests[0].text.format.strict, true);
+    assert.equal(requests[0].text.format.type, "json_schema");
+    const input = JSON.parse(requests[0].input);
+    assert.equal(input.role, "Designer");
+    assert.equal(input.pricing, "$500 fixed");
+    assert.match(input.clientContext, /more pages/);
+
+    const literalQuote = "甲方应在验收通过后\n  九十日内支付合同价款。";
+    const zhContract = "服务合同。".repeat(16) + literalQuote;
+    const zhReport = {
+      riskLevel: " high ",
+      summary: "  验收时间不明确会拖延回款。  ",
+      redFlags: [
+        { quote: "「甲方应在验收通过后 九十日内支付合同价款。」", plainEnglish: "客户可能拖着不验收。", suggestedRedline: "甲方应在交付后十四日内支付无争议款项。" },
+        { quote: "这是合同里不存在的句子。", plainEnglish: "错误条款", suggestedRedline: "错误建议" },
+      ],
+      emailReplies: { politeNegotiation: "您好，我们可以讨论付款条款吗？", firmDecline: "  " },
+    };
+    replies.push({ text: "\x60\x60\x60json\n" + JSON.stringify(zhReport) + "\n\x60\x60\x60" });
+    const recovered = await run({ contractText: zhContract, role: "设计师", pricing: "500元", clientContext: "客户催签，可能加页" });
+    assert.equal(recovered.status, 200);
+    const partial = await recovered.json();
+    assert.equal(partial.riskLevel, "HIGH");
+    assert.match(partial.summary, /未列入报告/);
+    assert.equal(partial.redFlags.length, 1);
+    assert.equal(partial.redFlags[0].quote, literalQuote);
+    assert.equal(partial.redFlags[0].clauseTitle, "合同条款");
+    assert.equal(partial.emailReplies.politeNegotiation, zhReport.emailReplies.politeNegotiation);
+    assert.match(partial.emailReplies.upsellPricing, /单独报价/);
+    assert.match(partial.emailReplies.firmDecline, /暂时无法/);
+    assert.equal(requests.length, 2);
+
+    replies.push(
+      { text: '{"summary":', status: "incomplete", reason: "max_output_tokens" },
+      { text: JSON.stringify(demoAnalysis) },
+    );
+    const retried = await run();
+    assert.equal(retried.status, 200);
+    assert.ok(requests[3].max_output_tokens > requests[2].max_output_tokens);
+
+    const allFabricated = { ...demoAnalysis, redFlags: [{ ...demoAnalysis.redFlags[0], quote: "This clause does not exist in the contract." }] };
+    replies.push({ text: JSON.stringify(allFabricated) }, { text: JSON.stringify(allFabricated) });
+    const rejected = await run();
+    assert.equal(rejected.status, 502);
+    assert.match((await rejected.json()).error, /verifiable/);
+
+    replies.push({ text: "{invalid", refusal: true });
+    assert.equal((await run()).status, 422);
+    assert.equal(requests.length, 7);
+    assert.equal(replies.length, 0);
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
 });
 
