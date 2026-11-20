@@ -1,0 +1,251 @@
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { Pool } from "pg";
+import { test } from "node:test";
+import type Stripe from "stripe";
+import { POST as checkout } from "../app/api/billing/checkout/route";
+import { GET as status } from "../app/api/billing/status/route";
+import { POST as webhook } from "../app/api/billing/webhook/route";
+import { POST as analyze } from "../app/api/analyze/route";
+import { demoContract } from "../lib/demo";
+import { billingConfig } from "../lib/billing/config";
+import { postgresOptions } from "../lib/billing/database";
+import { networkFromRequest, newWallet, walletCookie, walletFromRequest } from "../lib/billing/identity";
+import { AnalysisLimit, billingStatus, completeAnalysis, releaseAnalysis, reserveAnalysis } from "../lib/billing/store";
+import { stripeClient } from "../lib/billing/stripe";
+import { setupBillingDatabase, testDatabase } from "./billing-db";
+
+setupBillingDatabase();
+const origin = "http://localhost:3000";
+
+test("billing resolves Neon and legacy Postgres environment variables safely", () => {
+  const primary = "postgresql://app@primary.test/credits";
+  const legacy = "postgresql://app@legacy.test/credits";
+  const direct = "postgresql://app@direct.test/credits";
+  assert.equal(postgresOptions({ DATABASE_URL: primary, POSTGRES_URL: legacy }).connectionString, primary);
+  assert.equal(postgresOptions({ DATABASE_URL: "", POSTGRES_URL: legacy }).connectionString, legacy);
+  assert.equal(postgresOptions({ DATABASE_URL: primary, DATABASE_URL_UNPOOLED: direct }, true).connectionString, direct);
+  assert.equal(postgresOptions({ POSTGRES_URL_NON_POOLING: direct }).connectionString, direct);
+
+  const neon = postgresOptions({
+    DATABASE_URL: "postgresql://app@project-pooler.region.neon.tech/credits?sslmode=require&channel_binding=require",
+  });
+  assert.equal(new URL(neon.connectionString!).searchParams.get("sslmode"), "verify-full");
+  assert.equal(neon.enableChannelBinding, true);
+
+  assert.deepEqual(postgresOptions({
+    PGHOST: "project.region.neon.tech", PGUSER: "app", PGDATABASE: "credits", PGPORT: "5433",
+  }), {
+    host: "project.region.neon.tech", user: "app", database: "credits", port: 5433, password: undefined,
+    ssl: true, enableChannelBinding: true,
+  });
+  assert.throws(() => postgresOptions({ PGHOST: "localhost", PGPORT: "not-a-port" }), /Invalid Postgres port/);
+  assert.throws(() => postgresOptions({ DATABASE_URL: "https://invalid.test" }), /Invalid Postgres connection URL/);
+  assert.throws(() => postgresOptions({}), /Postgres is not configured/);
+});
+
+test("billing migration backfills wallet totals without changing balances and is repeatable", { skip: !testDatabase }, async () => {
+  const schema = "legacy_billing_" + randomBytes(6).toString("hex");
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 1 });
+  const db = await pool.connect();
+  try {
+    await db.query("CREATE SCHEMA " + schema);
+    await db.query("SET search_path TO " + schema);
+    await db.query(`
+      CREATE TABLE billing_wallets (
+        id uuid PRIMARY KEY, free_used integer NOT NULL DEFAULT 0, paid_balance integer NOT NULL DEFAULT 0
+      );
+      CREATE TABLE billing_purchases (
+        session_id text PRIMARY KEY, wallet_id uuid NOT NULL REFERENCES billing_wallets(id),
+        pack_id text NOT NULL, credits integer NOT NULL, amount integer NOT NULL, credited_at timestamptz
+      );
+    `);
+    const wallet = newWallet();
+    await db.query("INSERT INTO billing_wallets (id, free_used, paid_balance) VALUES ($1, 1, 3)", [wallet]);
+    await db.query(`
+      INSERT INTO billing_purchases (session_id, wallet_id, pack_id, credits, amount, credited_at)
+      VALUES ('credited-test', $1, 'starter', 5, 499, now()), ('pending-test', $1, 'plus', 10, 899, NULL)
+    `, [wallet]);
+    const sql = await readFile(new URL("../db/billing.sql", import.meta.url), "utf8");
+    const readWallet = () => db.query("SELECT * FROM billing_wallets WHERE id = $1", [wallet]).then(r => r.rows[0]);
+    await db.query(sql);
+    const migrated = await readWallet();
+    assert.equal(migrated.paid_balance, 3);
+    assert.equal(migrated.free_used, 1);
+    assert.equal(migrated.purchased_credits, "5");
+    assert.equal(migrated.used_analyses, "3");
+    assert.ok(migrated.updated_at instanceof Date);
+    await db.query(sql);
+    assert.deepEqual(await readWallet(), migrated);
+  } finally {
+    try {
+      await db.query("ROLLBACK");
+      await db.query("DROP SCHEMA IF EXISTS " + schema + " CASCADE");
+    } finally {
+      db.release();
+      await pool.end();
+    }
+  }
+});
+
+test("wallet tokens cannot be forged and Vercel IPv6 addresses share a /64 bucket", () => {
+  const config = {
+    app: new URL(origin), secret: randomBytes(32).toString("hex"), local: true,
+    packs: [], free: 2, freeDaily: 100, daily: 300, checkoutEnabled: false,
+  };
+  const wallet = newWallet();
+  const cookie = walletCookie(wallet, config).split(";")[0];
+  assert.equal(walletFromRequest(new Request(origin, { headers: { cookie } }), config), wallet);
+  assert.equal(walletFromRequest(new Request(origin, {
+    headers: { cookie: cookie.replace(wallet, newWallet()) },
+  }), config), null);
+
+  const saved = process.env.VERCEL;
+  const network = (ip: string) => networkFromRequest(new Request(origin, {
+    headers: { "x-vercel-forwarded-for": ip },
+  }), config);
+  try {
+    process.env.VERCEL = "1";
+    assert.equal(network("2001:db8::1"), network("2001:db8::10"));
+    assert.notEqual(network("2001:db8::1"), network("2001:db8:0:1::1"));
+    assert.equal(network("::ffff:192.0.2.1"), network("192.0.2.1"));
+    assert.equal(network("192.0.2.1, 192.0.2.2"), null);
+  } finally {
+    if (saved === undefined) delete process.env.VERCEL; else process.env.VERCEL = saved;
+  }
+});
+
+test("reservations serialize per wallet and per network, and only a completed report uses a credit", { skip: !testDatabase }, async () => {
+  const config = billingConfig();
+  const network = "reservation-test";
+  const wallet = newWallet();
+  const other = newWallet();
+  const stranger = newWallet();
+  const first = await reserveAnalysis(wallet, network, config);
+  assert.equal((await billingStatus(wallet, network, config)).remaining, 2);
+  await assert.rejects(reserveAnalysis(wallet, network, config), { code: "ANALYSIS_IN_PROGRESS" });
+
+  const contending = await Promise.allSettled([
+    reserveAnalysis(other, network, config),
+    reserveAnalysis(stranger, network, config),
+  ]);
+  assert.equal(contending.filter(result => result.status === "fulfilled").length, 1);
+  const winner = contending[0].status === "fulfilled" ? 0 : 1;
+  const won = contending[winner];
+  const lost = contending[1 - winner];
+  assert.equal(won.status, "fulfilled");
+  assert.equal(lost.status, "rejected");
+  assert.ok(lost.reason instanceof AnalysisLimit && lost.reason.code === "NO_CREDITS");
+  await completeAnalysis(winner === 0 ? other : stranger, won.value);
+
+  await releaseAnalysis(wallet, first);
+  assert.equal((await billingStatus(wallet, network, config)).remaining, 1);
+  const retry = await reserveAnalysis(wallet, network, config);
+  await completeAnalysis(wallet, retry);
+  await assert.rejects(reserveAnalysis(newWallet(), network, config), { code: "NO_CREDITS" });
+
+  const leased = await reserveAnalysis(wallet, "different-test-network", config);
+  await completeAnalysis(wallet, leased);
+  await assert.rejects(reserveAnalysis(wallet, "third-test-network", config), { code: "NO_CREDITS" });
+  await assert.rejects(reserveAnalysis(newWallet(), "fourth-test-network", { ...config, freeDaily: 0 }), { code: "FREE_DAILY_LIMIT" });
+  await assert.rejects(reserveAnalysis(newWallet(), "fifth-test-network", { ...config, daily: 0 }), { code: "DAILY_LIMIT" });
+});
+
+test("checkout uses server pricing and verified webhooks credit only the owning wallet once", { skip: !testDatabase }, async t => {
+  process.env.STRIPE_SECRET_KEY = "sk_test_" + randomBytes(16).toString("hex");
+  const webhookSecret = "whsec_" + randomBytes(16).toString("hex");
+  process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
+  const stripe = stripeClient();
+  const sessionId = "cs_test_" + randomBytes(10).toString("hex");
+  let params: Stripe.Checkout.SessionCreateParams | undefined;
+  t.mock.method(stripe.checkout.sessions, "create", async (input: Stripe.Checkout.SessionCreateParams) => {
+    params = input;
+    return { id: sessionId, url: "https://checkout.stripe.com/test-checkout" };
+  });
+
+  const initial = await status(new Request(origin + "/api/billing/status"));
+  assert.equal(initial.status, 200);
+  const fresh = await initial.json();
+  assert.deepEqual([fresh.remaining, fresh.used, fresh.purchased], [2, 0, 0]);
+  assert.ok(Number.isFinite(Date.parse(fresh.updatedAt)));
+  const signed = initial.headers.get("set-cookie");
+  assert.ok(signed && signed.includes("HttpOnly"));
+  const cookie = signed.split(";")[0];
+  const config = billingConfig();
+  const wallet = walletFromRequest(new Request(origin, { headers: { cookie } }), config);
+  assert.ok(wallet);
+  const network = networkFromRequest(new Request(origin), config);
+  const noCreditsWallet = newWallet();
+  const hold1 = await reserveAnalysis(noCreditsWallet, network, config);
+  await completeAnalysis(noCreditsWallet, hold1);
+  const hold2 = await reserveAnalysis(noCreditsWallet, network, config);
+  await completeAnalysis(noCreditsWallet, hold2);
+
+  process.env.OPENAI_API_KEY = randomBytes(16).toString("hex");
+  process.env.OPENAI_BASE_URL = "http://127.0.0.1:1/v1";
+  const blocked = await analyze(new Request(origin + "/api/analyze", {
+    method: "POST",
+    headers: { cookie, origin, "Content-Type": "application/json" },
+    body: JSON.stringify({ contractText: demoContract }),
+  }));
+  assert.equal(blocked.status, 200);
+  assert.equal(blocked.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await blocked.json(), {
+    code: "NO_CREDITS",
+    message: "You’ve used all your available analyses.",
+  });
+
+  const start = (packId: string, requestOrigin = origin) => checkout(new Request(origin + "/api/billing/checkout", {
+    method: "POST", headers: { cookie, origin: requestOrigin, "Content-Type": "application/json" },
+    body: JSON.stringify({ packId, amount: 1 }),
+  }));
+  assert.equal((await start("starter", "https://unrelated.example")).status, 403);
+  assert.equal((await start("unknown")).status, 400);
+  assert.equal(params, undefined);
+  assert.equal((await start("starter")).status, 200);
+  const captured = params as Stripe.Checkout.SessionCreateParams | undefined;
+  assert.equal(captured?.line_items?.[0].price_data?.unit_amount, 499);
+  assert.equal(captured?.client_reference_id, wallet);
+  assert.equal(captured?.locale, "en");
+  assert.match(captured?.success_url ?? "", /^http:\/\/localhost:3000\/\?checkout=success/);
+
+  const returned = origin + "/api/billing/status?session_id=" + sessionId;
+  const read = async (credential = cookie) => (await status(new Request(returned, { headers: { cookie: credential } }))).json();
+  assert.deepEqual([(await read()).checkout, (await read()).remaining], ["pending", 0]);
+
+  const notify = (type: string, paymentStatus: string, amount: number, validSignature = true) => {
+    const payload = JSON.stringify({
+      id: "evt_" + randomBytes(8).toString("hex"),
+      type,
+      data: { object: {
+        id: sessionId, mode: "payment", currency: "usd", amount_total: amount,
+        payment_status: paymentStatus, client_reference_id: wallet, metadata: captured?.metadata,
+      } },
+    });
+    const header = stripe.webhooks.generateTestHeaderString({ payload, secret: webhookSecret });
+    return webhook(new Request(origin + "/api/billing/webhook", {
+      method: "POST", body: payload, headers: { "stripe-signature": validSignature ? header : "invalid" },
+    }));
+  };
+
+  assert.equal((await notify("checkout.session.completed", "paid", 499, false)).status, 400);
+  assert.equal((await notify("checkout.session.completed", "unpaid", 499)).status, 200);
+  assert.equal((await notify("checkout.session.completed", "paid", 1)).status, 200);
+  assert.equal((await read()).remaining, 0);
+  const delivered = await Promise.all([
+    notify("checkout.session.completed", "paid", 499),
+    notify("checkout.session.async_payment_succeeded", "paid", 499),
+  ]);
+  assert.deepEqual(delivered.map(response => response.status), [200, 200]);
+  const paid = await read();
+  assert.equal(paid.checkout, "credited");
+  assert.equal(paid.remaining, 5);
+  assert.deepEqual([paid.used, paid.purchased], [0, 5]);
+  const anotherCookie = walletCookie(newWallet(), config).split(";")[0];
+  assert.deepEqual([(await read(anotherCookie)).checkout, (await read(anotherCookie)).paid], [null, 0]);
+  const hold = await reserveAnalysis(wallet, network, config);
+  await completeAnalysis(wallet, hold);
+  const afterSpend = await read();
+  assert.deepEqual([afterSpend.paid, afterSpend.used, afterSpend.purchased], [4, 1, 5]);
+});

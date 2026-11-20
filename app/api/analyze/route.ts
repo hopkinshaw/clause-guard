@@ -1,7 +1,10 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { analysisSchema, inputSchema } from "@/lib/analysis";
-import { analysisInstructions, isPrimarilyChinese, requiresChineseReport, verifyReport } from "./report";
+import { billingConfig } from "@/lib/billing/config";
+import { networkFromRequest, walletFromRequest } from "@/lib/billing/identity";
+import { AnalysisLimit, completeAnalysis, releaseAnalysis, reserveAnalysis } from "@/lib/billing/store";
+import { analysisInstructions, verifyReport } from "./report";
 
 export const runtime = "nodejs";
 export const maxDuration = 90;
@@ -25,10 +28,38 @@ export async function POST(request: Request) {
   if (!input.success) return Response.json({ error: input.error.issues[0]?.message ?? "Invalid input." }, { status: 400 });
   if (!process.env.OPENAI_API_KEY) return Response.json({ error: "Analysis is not configured yet. Add OPENAI_API_KEY to the server environment. You can still explore the sample report." }, { status: 503 });
 
-  const chineseReport = requiresChineseReport(input.data.contractText, input.data.clientContext, request.headers.get("x-ui-language"));
-  const instructions = chineseReport
-    ? analysisInstructions + "\n\nReport language: natural Chinese for all generated prose. Keep each quote exactly as it appears in the source."
-    : analysisInstructions;
+  let wallet: string | null = null;
+  let reservation: string | undefined;
+  try {
+    const config = billingConfig();
+    const origin = request.headers.get("origin");
+    if (origin && origin !== config.app.origin) {
+      return Response.json({ error: "Open analysis from the main ClauseGuard site." }, { status: 403 });
+    }
+    wallet = walletFromRequest(request, config);
+    if (!wallet) {
+      return Response.json({ error: "Refresh the page to start a credit session.", code: "BILLING_SESSION_REQUIRED" }, { status: 428 });
+    }
+    reservation = await reserveAnalysis(wallet, networkFromRequest(request, config), config);
+  } catch (error) {
+    if (error instanceof AnalysisLimit) {
+      if (error.code === "NO_CREDITS") {
+        return Response.json({
+          code: "NO_CREDITS",
+          message: "You’ve used all your available analyses.",
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
+      const details = {
+        ANALYSIS_IN_PROGRESS: [409, "An analysis is already in progress. Please wait for it to finish."],
+        DAILY_LIMIT: [429, "Today’s analysis limit has been reached. Please try again tomorrow (UTC)."],
+        FREE_DAILY_LIMIT: [429, "Today’s free analysis limit has been reached. Buy credits or try again tomorrow (UTC)."],
+      } as const;
+      const [status, message] = details[error.code];
+      return Response.json({ error: message, code: error.code }, { status });
+    }
+    return Response.json({ error: "Credit validation is temporarily unavailable." }, { status: 503 });
+  }
+
   try {
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
     const deadline = performance.now() + ANALYSIS_BUDGET_MS;
@@ -48,8 +79,8 @@ export async function POST(request: Request) {
         ...params,
         max_output_tokens: retryReason === "truncated" ? TRUNCATION_RETRY_TOKENS : INITIAL_OUTPUT_TOKENS,
         instructions: retryReason
-          ? instructions + "\n\nRegenerate a complete JSON report. Use at most three of the most material risks and short continuous verbatim quotes. Keep the summary and drafts concise. Preserve every essential protection in each selected replacement clause and use the required language throughout."
-          : instructions,
+          ? analysisInstructions + "\n\nRegenerate a complete JSON report. Use at most three of the most material risks and short continuous verbatim quotes. Keep the summary and drafts concise. Preserve every essential protection in each selected replacement clause and write all generated prose in English."
+          : analysisInstructions,
       }, { timeout: Math.min(75_000, remainingMs), signal: request.signal });
 
       const refused = response.output.some(item =>
@@ -65,11 +96,15 @@ export async function POST(request: Request) {
       if (response.status !== "completed") {
         return Response.json({ error: "The AI service did not complete the analysis. Please try again." }, { status: 502 });
       }
-      const report = verifyReport(response.output_text, input.data.contractText, chineseReport);
+      const report = verifyReport(response.output_text, input.data.contractText);
       if (report) {
-        const headers = new Headers({ "Cache-Control": "no-store" });
-        if (chineseReport || isPrimarilyChinese(report.summary)) headers.set("Content-Language", "zh");
-        return Response.json(report, { headers });
+        try {
+          await completeAnalysis(wallet, reservation);
+          reservation = undefined;
+        } catch {
+          return Response.json({ error: "Could not confirm the analysis credit. Please refresh and check your balance." }, { status: 503 });
+        }
+        return Response.json(report, { headers: { "Cache-Control": "no-store", "Content-Language": "en" } });
       }
       retryReason = "unverifiable";
     }
@@ -83,5 +118,11 @@ export async function POST(request: Request) {
     if (error instanceof OpenAI.APIError && error.code === "context_length_exceeded") return Response.json({ error: "This contract is too long for the configured model. Try a shorter excerpt." }, { status: 413 });
     if (error instanceof OpenAI.APIConnectionTimeoutError) return Response.json({ error: "Analysis timed out. Please try again with a shorter contract." }, { status: 504 });
     return Response.json({ error: "Analysis is temporarily unavailable. Please try again later." }, { status: 502 });
+  } finally {
+    if (reservation) {
+      await releaseAnalysis(wallet, reservation).catch(() => {
+        console.error("Could not release an analysis reservation; it will expire.");
+      });
+    }
   }
 }

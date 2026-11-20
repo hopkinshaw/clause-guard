@@ -3,9 +3,14 @@ import { after, test } from "node:test";
 import { createServer } from "node:http";
 import { POST as analyze } from "../app/api/analyze/route";
 import { verifyReport } from "../app/api/analyze/report";
+import { GET as creditStatus } from "../app/api/billing/status/route";
+import { setupBillingDatabase, testDatabase } from "./billing-db";
+
 import { POST as extract } from "../app/api/extract/route";
 import { demoAnalysis, demoContract } from "../lib/demo";
 import { quotesMatchContract } from "../lib/analysis";
+
+setupBillingDatabase(20);
 
 const originalKey = process.env.OPENAI_API_KEY;
 const originalBase = process.env.OPENAI_BASE_URL;
@@ -14,9 +19,9 @@ after(() => {
   if (originalBase === undefined) delete process.env.OPENAI_BASE_URL; else process.env.OPENAI_BASE_URL = originalBase;
 });
 
-const jsonRequest = (body: unknown, uiLanguage = "en") => new Request("http://localhost/api/analyze", {
+const jsonRequest = (body: unknown) => new Request("http://localhost/api/analyze", {
   method: "POST",
-  headers: { "Content-Type": "application/json", "X-UI-Language": uiLanguage },
+  headers: { "Content-Type": "application/json" },
   body: JSON.stringify(body),
 });
 const fileRequest = (name: string, text: string | Uint8Array) => {
@@ -38,7 +43,7 @@ test("analysis reports missing configuration without returning the sample as rea
   assert.ok((await response.json()).error.includes("OPENAI_API_KEY"));
 });
 
-test("analysis recovers from provider output failures while preserving quote verification", async () => {
+test("analysis recovers from provider output failures while preserving quote verification", { skip: !testDatabase }, async () => {
   type ProviderReply = { text: string; status?: "completed" | "incomplete"; reason?: string; refusal?: boolean };
   const replies: ProviderReply[] = [];
   const requests: { store: boolean; text: { format: { strict: boolean; type: string } }; input: string; max_output_tokens: number; instructions: string }[] = [];
@@ -67,14 +72,23 @@ test("analysis recovers from provider output failures while preserving quote ver
   assert.ok(address && typeof address !== "string");
   process.env.OPENAI_API_KEY = "test-key";
   process.env.OPENAI_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
-  const run = (body = { contractText: demoContract, role: "Designer", pricing: "$500 fixed", clientContext: "Client is rushing the signature; more pages may be needed." }, uiLanguage?: string) =>
-    analyze(jsonRequest(body, uiLanguage));
+  const bootstrap = await creditStatus(new Request("http://localhost:3000/api/billing/status"));
+  const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
+  assert.equal(bootstrap.status, 200);
+  assert.ok(cookie);
+  const readCredits = () => creditStatus(new Request("http://localhost:3000/api/billing/status", {
+    headers: { cookie },
+  })).then(response => response.json());
+  const run = (body = { contractText: demoContract, role: "Designer", pricing: "$500 fixed", clientContext: "Client is rushing the signature; more pages may be needed." }) =>
+    analyze(new Request(jsonRequest(body), { headers: { "Content-Type": "application/json", cookie } }));
 
   try {
     replies.push({ text: JSON.stringify(demoAnalysis) });
     const valid = await run();
     assert.equal(valid.status, 200);
     assert.deepEqual(await valid.json(), demoAnalysis);
+    const afterSuccess = await readCredits();
+    assert.deepEqual([afterSuccess.remaining, afterSuccess.used], [19, 1]);
     assert.equal(requests[0].store, false);
     assert.equal(requests[0].text.format.strict, true);
     assert.equal(requests[0].text.format.type, "json_schema");
@@ -83,49 +97,46 @@ test("analysis recovers from provider output failures while preserving quote ver
     assert.equal(input.pricing, "$500 fixed");
     assert.match(input.clientContext, /more pages/);
 
-    const literalQuote = "甲方应在验收通过后\n  九十日内支付合同价款。";
-    const zhContract = "服务合同。".repeat(16) + literalQuote;
-    const zhReport = {
-      riskLevel: " 高风险 ",
-      summary: "  验收时间不明确会拖延回款。  ",
+    const literalQuote = "El cliente pagará dentro de los noventa días\n  siguientes a la aceptación del trabajo.";
+    const foreignContract = "Contrato de prestación de servicios. " + literalQuote;
+    // Simulate the provider returning a non-Latin character in a generated field.
+    const wrongScript = String.fromCodePoint(0x0410);
+    const draft = {
+      riskLevel: " high ",
+      summary: "  An undefined acceptance deadline could delay payment.  ",
       redFlags: [
-        { quote: "「甲方应在验收通过后 九十日内支付合同价款。」", plainEnglish: "客户可能拖着不验收。", suggestedRedline: "甲方应在交付后十四日内支付无争议款项。" },
-        { quote: "这是合同里不存在的句子。", plainEnglish: "错误条款", suggestedRedline: "错误建议" },
+        { quote: "“El cliente pagará dentro de los noventa días siguientes a la aceptación del trabajo.”", plainEnglish: "The client can delay acceptance.", suggestedRedline: "The client shall pay undisputed amounts within fourteen days of delivery." },
+        { quote: "This sentence is not in the contract.", plainEnglish: "Unfounded risk.", suggestedRedline: "Unfounded suggestion." },
       ],
-      emailReplies: { politeNegotiation: "您好，我们可以讨论付款条款吗？", firmDecline: "  " },
+      emailReplies: { politeNegotiation: "Hello, could we review the payment terms?", upsellPricing: wrongScript, firmDecline: "  " },
     };
-    replies.push({ text: "\x60\x60\x60json\n" + JSON.stringify(zhReport) + "\n\x60\x60\x60" });
-    const recovered = await run({ contractText: zhContract, role: "设计师", pricing: "500元", clientContext: "" });
+    const foreignInput = { contractText: foreignContract, role: "Designer", pricing: "500 EUR", clientContext: "" };
+    replies.push({ text: "\x60\x60\x60json\n" + JSON.stringify(draft) + "\n\x60\x60\x60" });
+    const recovered = await run(foreignInput);
     assert.equal(recovered.status, 200);
-    assert.equal(recovered.headers.get("content-language"), "zh");
+    assert.equal(recovered.headers.get("content-language"), "en");
     const partial = await recovered.json();
     assert.equal(partial.riskLevel, "HIGH");
-    assert.match(partial.summary, /未列入报告/);
+    assert.match(partial.summary, /Some findings were omitted/);
     assert.equal(partial.redFlags.length, 1);
     assert.equal(partial.redFlags[0].quote, literalQuote);
-    assert.equal(partial.redFlags[0].clauseTitle, "合同条款");
-    assert.equal(partial.emailReplies.politeNegotiation, zhReport.emailReplies.politeNegotiation);
-    assert.match(partial.emailReplies.upsellPricing, /单独报价/);
-    assert.match(partial.emailReplies.firmDecline, /暂时无法/);
+    assert.equal(partial.redFlags[0].clauseTitle, "Contract clause");
+    assert.equal(partial.emailReplies.politeNegotiation, draft.emailReplies.politeNegotiation);
+    assert.match(partial.emailReplies.upsellPricing, /separate quote/);
+    assert.match(partial.emailReplies.firmDecline, /won't be moving forward/);
     assert.equal(requests.length, 2);
-    assert.match(requests[1].instructions, /Report language: natural Chinese/);
+    assert.match(requests[1].instructions, /in clear English regardless of the input language/);
 
-    const englishQuote = demoAnalysis.redFlags[0].quote;
-    const localizedReport = {
-      ...zhReport,
-      redFlags: [{ ...zhReport.redFlags[0], quote: englishQuote, clauseTitle: "Payment risk" }],
-      emailReplies: { ...zhReport.emailReplies, upsellPricing: "Hello, let's discuss extra scope." },
-    };
-    const beforeLocalized = requests.length;
-    replies.push({ text: JSON.stringify(demoAnalysis) }, { text: JSON.stringify(localizedReport) });
-    const localized = await run(undefined, "zh-CN");
-    assert.equal(localized.status, 200);
-    const localizedBody = await localized.json();
-    assert.equal(localizedBody.redFlags[0].quote, englishQuote);
-    assert.equal(localizedBody.redFlags[0].clauseTitle, "合同条款");
-    assert.match(localizedBody.emailReplies.upsellPricing, /单独报价/);
-    assert.equal(requests.length, beforeLocalized + 2);
-    assert.match(requests[beforeLocalized].instructions, /Report language: natural Chinese/);
+    const beforeLanguageRetry = requests.length;
+    replies.push(
+      { text: JSON.stringify({ ...draft, summary: "Payment risk " + wrongScript }) },
+      { text: JSON.stringify(draft) },
+    );
+    const languageRetry = await run(foreignInput);
+    assert.equal(languageRetry.status, 200);
+    assert.equal((await languageRetry.json()).redFlags[0].quote, literalQuote);
+    assert.equal(requests.length, beforeLanguageRetry + 2);
+    assert.match(requests[beforeLanguageRetry + 1].instructions, /write all generated prose in English/);
 
     const beforeTruncation = requests.length;
     replies.push(
@@ -148,31 +159,33 @@ test("analysis recovers from provider output failures while preserving quote ver
     assert.equal((await run()).status, 422);
     assert.equal(requests.length, 9);
     assert.equal(replies.length, 0);
+    const afterFailures = await readCredits();
+    assert.deepEqual([afterFailures.remaining, afterFailures.used], [16, 4]);
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
 });
 
 test("duplicate action drafts use strategy-specific fallbacks without replacing a distinct draft", () => {
   const draft = {
     ...demoAnalysis,
-    summary: "付款期限需要澄清。",
+    summary: "The payment deadline needs clarification.",
     redFlags: [],
     emailReplies: {
-      politeNegotiation: "您好，请修改付款条款。",
-      upsellPricing: "你好，\n请修改付款条款！",
-      firmDecline: "谢谢您的邀请。按现有条款，我决定婉拒这个项目。",
+      politeNegotiation: "Hello, please revise the payment terms.",
+      upsellPricing: "Hi,\nPlease revise the payment terms!",
+      firmDecline: "Thank you for the offer. I am declining the agreement on its current terms.",
     },
   };
-  const report = verifyReport(JSON.stringify(draft), demoContract, true);
+  const report = verifyReport(JSON.stringify(draft), demoContract);
   assert.ok(report);
-  assert.match(report.emailReplies.politeNegotiation, /书面方式确认.*付款条件/);
-  assert.match(report.emailReplies.upsellPricing, /单独报价.*费用和排期/);
+  assert.match(report.emailReplies.politeNegotiation, /confirm the scope and payment terms in writing/);
+  assert.match(report.emailReplies.upsellPricing, /separate quote.*scope, cost, and timing/);
   assert.equal(report.emailReplies.firmDecline, draft.emailReplies.firmDecline);
   assert.equal(new Set(Object.values(report.emailReplies)).size, 3);
 
   const misplaced = verifyReport(JSON.stringify({
     ...draft,
     emailReplies: { ...draft.emailReplies, politeNegotiation: "", upsellPricing: report.emailReplies.politeNegotiation },
-  }), demoContract, true);
+  }), demoContract);
   assert.deepEqual(misplaced?.emailReplies, report.emailReplies);
 });
 
