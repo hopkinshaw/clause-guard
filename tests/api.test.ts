@@ -5,12 +5,15 @@ import { POST as analyze } from "../app/api/analyze/route";
 import { verifyReport } from "../app/api/analyze/report";
 import { GET as creditStatus } from "../app/api/billing/status/route";
 import { setupBillingDatabase, testDatabase } from "./billing-db";
+import { billingConfig } from "../lib/billing/config";
+import { walletFromRequest } from "../lib/billing/identity";
+import { creditPurchase, savePurchase } from "../lib/billing/store";
 
 import { POST as extract } from "../app/api/extract/route";
 import { demoAnalysis, demoContract } from "../lib/demo";
 import { quotesMatchContract } from "../lib/analysis";
 
-setupBillingDatabase(20);
+setupBillingDatabase();
 
 const originalKey = process.env.OPENAI_API_KEY;
 const originalBase = process.env.OPENAI_BASE_URL;
@@ -76,6 +79,11 @@ test("analysis recovers from provider output failures while preserving quote ver
   const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
   assert.equal(bootstrap.status, 200);
   assert.ok(cookie);
+  const wallet = walletFromRequest(new Request("http://localhost:3000", { headers: { cookie } }), billingConfig());
+  assert.ok(wallet);
+  const pack = { id: "test-report-fixture", credits: 18, amount: 499 };
+  await savePurchase("cs_test_report_fixture", wallet, pack);
+  assert.equal(await creditPurchase("cs_test_report_fixture", wallet, pack.id, pack.amount), true);
   const readCredits = () => creditStatus(new Request("http://localhost:3000/api/billing/status", {
     headers: { cookie },
   })).then(response => response.json());

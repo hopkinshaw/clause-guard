@@ -91,6 +91,16 @@ export function useBilling() {
     };
   }, [refresh]);
 
+  function showCreditLimit(message: string, packs: Pack[]) {
+    setCreditNotice(message);
+    setBalance(current => ({
+      ...current,
+      remaining: 0, free: 0, paid: 0,
+      checkout: current?.checkout ?? null,
+      packs,
+    }));
+  }
+
   async function buy(packId: string) {
     if (buying) return;
     setBuying(packId);
@@ -111,7 +121,7 @@ export function useBilling() {
     }
   }
 
-  return { balance, unavailable, payment, buying, checkoutError, creditNotice, setCreditNotice, refresh, buy };
+  return { balance, unavailable, payment, buying, checkoutError, creditNotice, setCreditNotice, showCreditLimit, refresh, buy };
 }
 
 export function BillingPanel({
@@ -121,7 +131,7 @@ export function BillingPanel({
   const showCreditNotice = creditNotice || (!unavailable && balance?.remaining === 0);
   const price = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
-  return <section className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3" aria-label="Analysis credits">
+  return <section id="analysis-credits" className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3" aria-label="Analysis credits">
     <div className="flex flex-wrap items-center justify-between gap-2">
       <strong className="text-sm text-slate-800" aria-live="polite">
         {balance

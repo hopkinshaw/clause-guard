@@ -7,7 +7,7 @@ export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
-    const config = billingConfig();
+    const config = billingConfig(request);
     if (request.headers.get("origin") !== config.app.origin) {
       return Response.json({ error: "Open checkout from the main ClauseGuard site." }, { status: 403 });
     }
@@ -19,6 +19,7 @@ export async function POST(request: Request) {
     const pack = config.packs.find(item => item.id === body?.packId);
     if (!pack) return Response.json({ error: "Choose an available credit pack." }, { status: 400 });
     const stripe = stripeClient();
+    const returnUrl = new URL("/", config.app).href;
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       locale: "en",
@@ -32,8 +33,8 @@ export async function POST(request: Request) {
         },
         quantity: 1,
       }],
-      success_url: config.app.href + "?checkout=success&session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: config.app.href + "?checkout=canceled",
+      success_url: returnUrl + "?checkout=success&session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: returnUrl + "?checkout=canceled",
     });
 
     if (!session.url) throw new Error("Checkout URL is missing");

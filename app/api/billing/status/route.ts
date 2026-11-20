@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   try {
-    const config = billingConfig();
+    const config = billingConfig(request);
     const existing = walletFromRequest(request, config);
     const wallet = existing ?? newWallet();
     if (!existing) await initializeWallet(wallet);

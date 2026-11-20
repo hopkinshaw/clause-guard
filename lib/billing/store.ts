@@ -90,7 +90,7 @@ export async function reserveAnalysis(wallet: string, network: string | null, co
     }
 
     let freeNetwork: string | null = null;
-    if (network && balance.free_used < config.free) {
+    if (balance.paid_balance === 0 && network && balance.free_used < config.free) {
       await client.query("INSERT INTO billing_networks (id) VALUES ($1) ON CONFLICT DO NOTHING", [network]);
       const { rows: [bucket] } = await client.query<{ free_used: number }>(
         "SELECT free_used FROM billing_networks WHERE id = $1 FOR UPDATE", [network],
@@ -109,8 +109,7 @@ export async function reserveAnalysis(wallet: string, network: string | null, co
     );
     if (daily.attempts >= config.daily) throw new AnalysisLimit("DAILY_LIMIT");
     if (freeNetwork && daily.free_attempts >= config.freeDaily) {
-      if (balance.paid_balance === 0) throw new AnalysisLimit("FREE_DAILY_LIMIT");
-      freeNetwork = null;
+      throw new AnalysisLimit("FREE_DAILY_LIMIT");
     }
 
     const id = randomUUID();
@@ -137,7 +136,11 @@ export async function completeAnalysis(wallet: string, id: string) {
       await client.query("UPDATE billing_networks SET free_used = free_used + 1 WHERE id = $1", [hold.network_id]);
       await client.query("UPDATE billing_wallets SET free_used = free_used + 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1", [wallet]);
     } else {
-      await client.query("UPDATE billing_wallets SET paid_balance = paid_balance - 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1", [wallet]);
+      const deducted = await client.query(
+        "UPDATE billing_wallets SET paid_balance = paid_balance - 1, used_analyses = used_analyses + 1, updated_at = now() WHERE id = $1 AND paid_balance > 0",
+        [wallet],
+      );
+      if (deducted.rowCount !== 1) throw new Error("Reserved paid credit is no longer available");
     }
     await client.query("DELETE FROM billing_reservations WHERE id = $1", [id]);
   });
@@ -158,7 +161,8 @@ export async function savePurchase(session: string, wallet: string, pack: Pack) 
 }
 
 export async function creditPurchase(session: string, wallet: string, packId: string, amount: number) {
-  await db().query(`
+  const values = [session, wallet, packId, amount];
+  const credited = await db().query(`
     WITH purchase AS (
       UPDATE billing_purchases SET credited_at = now()
       WHERE session_id = $1 AND wallet_id = $2 AND pack_id = $3 AND amount = $4 AND credited_at IS NULL
@@ -169,5 +173,12 @@ export async function creditPurchase(session: string, wallet: string, packId: st
         purchased_credits = w.purchased_credits + p.credits,
         updated_at = now()
     FROM purchase p WHERE w.id = p.wallet_id
-  `, [session, wallet, packId, amount]);
+  `, values);
+  if (credited.rowCount === 1) return true;
+
+  const existing = await db().query(`
+    SELECT 1 FROM billing_purchases
+    WHERE session_id = $1 AND wallet_id = $2 AND pack_id = $3 AND amount = $4 AND credited_at IS NOT NULL
+  `, values);
+  return existing.rowCount === 1;
 }

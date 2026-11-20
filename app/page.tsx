@@ -82,8 +82,9 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Analysis failed. Please try again.");
-      if (data.code === "NO_CREDITS") {
-        billing.setCreditNotice(data.message);
+      if (data.status === "needs_credits" && data.code === "NO_CREDITS") {
+        billing.showCreditLimit(data.message, data.checkout?.packs ?? []);
+        document.getElementById("analysis-credits")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
         return;
       }
       setReport(analysisSchema.parse(data)); setIsDemo(false);

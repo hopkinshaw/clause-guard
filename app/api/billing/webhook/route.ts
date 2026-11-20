@@ -6,8 +6,8 @@ import { stripeClient } from "@/lib/billing/stripe";
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret || !process.env.STRIPE_SECRET_KEY) return new Response("Webhook is unavailable", { status: 503 });
+  const secret = process.env.STRIPE_WEBHOOK_SECRET?.trim();
+  if (!secret || !process.env.STRIPE_SECRET_KEY?.trim()) return new Response("Webhook is unavailable", { status: 503 });
   const signature = request.headers.get("stripe-signature");
   if (!signature) return new Response("Missing signature", { status: 400 });
 
@@ -28,7 +28,8 @@ export async function POST(request: Request) {
         checkoutSessionPattern.test(session.id)) {
       try {
         // The database verifies the checkout snapshot and credits each session at most once.
-        await creditPurchase(session.id, metadata.wallet, metadata.pack, session.amount_total);
+        const confirmed = await creditPurchase(session.id, metadata.wallet, metadata.pack, session.amount_total);
+        if (!confirmed) return new Response("Checkout record could not be confirmed", { status: 503 });
       } catch {
         return new Response("Could not credit purchase", { status: 503 });
       }

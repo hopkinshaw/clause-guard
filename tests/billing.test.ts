@@ -8,11 +8,11 @@ import { POST as checkout } from "../app/api/billing/checkout/route";
 import { GET as status } from "../app/api/billing/status/route";
 import { POST as webhook } from "../app/api/billing/webhook/route";
 import { POST as analyze } from "../app/api/analyze/route";
-import { demoContract } from "../lib/demo";
+import { demoAnalysis, demoContract } from "../lib/demo";
 import { billingConfig } from "../lib/billing/config";
 import { postgresOptions } from "../lib/billing/database";
 import { networkFromRequest, newWallet, walletCookie, walletFromRequest } from "../lib/billing/identity";
-import { AnalysisLimit, billingStatus, completeAnalysis, releaseAnalysis, reserveAnalysis } from "../lib/billing/store";
+import { AnalysisLimit, billingStatus, completeAnalysis, creditPurchase, releaseAnalysis, reserveAnalysis, savePurchase } from "../lib/billing/store";
 import { stripeClient } from "../lib/billing/stripe";
 import { setupBillingDatabase, testDatabase } from "./billing-db";
 
@@ -43,6 +43,27 @@ test("billing resolves Neon and legacy Postgres environment variables safely", (
   assert.throws(() => postgresOptions({ PGHOST: "localhost", PGPORT: "not-a-port" }), /Invalid Postgres port/);
   assert.throws(() => postgresOptions({ DATABASE_URL: "https://invalid.test" }), /Invalid Postgres connection URL/);
   assert.throws(() => postgresOptions({}), /Postgres is not configured/);
+});
+
+test("billing normalizes the canonical URL or uses the request origin without trusting headers", () => {
+  const savedUrl = process.env.APP_URL;
+  const savedSecret = process.env.BILLING_COOKIE_SECRET;
+  try {
+    process.env.BILLING_COOKIE_SECRET = randomBytes(32).toString("hex");
+    const request = new Request("https://preview.example/api/billing/checkout?foo=bar", {
+      headers: { origin: "https://unrelated.example", "x-forwarded-host": "unrelated.example" },
+    });
+    process.env.APP_URL = "https://clauseguard.example///";
+    assert.equal(billingConfig(request).app.href, "https://clauseguard.example/");
+    delete process.env.APP_URL;
+    assert.equal(billingConfig(request).app.href, "https://preview.example/");
+    assert.throws(() => billingConfig(new Request("http://preview.example/api/billing/checkout")), /Invalid billing site origin/);
+    delete process.env.BILLING_COOKIE_SECRET;
+    assert.throws(() => billingConfig(request), /Missing billing cookie secret/);
+  } finally {
+    if (savedUrl === undefined) delete process.env.APP_URL; else process.env.APP_URL = savedUrl;
+    if (savedSecret === undefined) delete process.env.BILLING_COOKIE_SECRET; else process.env.BILLING_COOKIE_SECRET = savedSecret;
+  }
 });
 
 test("billing migration backfills wallet totals without changing balances and is repeatable", { skip: !testDatabase }, async () => {
@@ -152,7 +173,28 @@ test("reservations serialize per wallet and per network, and only a completed re
   await assert.rejects(reserveAnalysis(newWallet(), "fifth-test-network", { ...config, daily: 0 }), { code: "DAILY_LIMIT" });
 });
 
-test("checkout uses server pricing and verified webhooks credit only the owning wallet once", { skip: !testDatabase }, async t => {
+test("a paid reservation is used before free credits and a released reservation spends neither", { skip: !testDatabase }, async () => {
+  const config = billingConfig();
+  const wallet = newWallet();
+  const network = "paid-first-test";
+  const pack = config.packs[0];
+  const session = "cs_test_" + randomBytes(10).toString("hex");
+  await savePurchase(session, wallet, pack);
+  assert.equal(await creditPurchase(session, wallet, pack.id, pack.amount), true);
+
+  const released = await reserveAnalysis(wallet, network, config);
+  await releaseAnalysis(wallet, released);
+  const unchanged = await billingStatus(wallet, network, config);
+  assert.deepEqual([unchanged.free, unchanged.paid, unchanged.used], [2, pack.credits, 0]);
+
+  const spent = await reserveAnalysis(wallet, network, config);
+  await completeAnalysis(wallet, spent);
+  await assert.rejects(completeAnalysis(wallet, spent), /reservation is no longer valid/);
+  const afterSpend = await billingStatus(wallet, network, config);
+  assert.deepEqual([afterSpend.free, afterSpend.paid, afterSpend.used], [2, pack.credits - 1, 1]);
+});
+
+test("two analyses, quota block, and verified Stripe payment restore credits on the same wallet", { skip: !testDatabase }, async t => {
   process.env.STRIPE_SECRET_KEY = "sk_test_" + randomBytes(16).toString("hex");
   const webhookSecret = "whsec_" + randomBytes(16).toString("hex");
   process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
@@ -164,6 +206,9 @@ test("checkout uses server pricing and verified webhooks credit only the owning 
     return { id: sessionId, url: "https://checkout.stripe.com/test-checkout" };
   });
 
+  // A stale production setting must not grant a third free report.
+  process.env.FREE_ANALYSIS_CREDITS = "3";
+  process.env.APP_URL = origin + "///";
   const initial = await status(new Request(origin + "/api/billing/status"));
   assert.equal(initial.status, 200);
   const fresh = await initial.json();
@@ -175,26 +220,50 @@ test("checkout uses server pricing and verified webhooks credit only the owning 
   const config = billingConfig();
   const wallet = walletFromRequest(new Request(origin, { headers: { cookie } }), config);
   assert.ok(wallet);
-  const network = networkFromRequest(new Request(origin), config);
-  const noCreditsWallet = newWallet();
-  const hold1 = await reserveAnalysis(noCreditsWallet, network, config);
-  await completeAnalysis(noCreditsWallet, hold1);
-  const hold2 = await reserveAnalysis(noCreditsWallet, network, config);
-  await completeAnalysis(noCreditsWallet, hold2);
-
   process.env.OPENAI_API_KEY = randomBytes(16).toString("hex");
-  process.env.OPENAI_BASE_URL = "http://127.0.0.1:1/v1";
-  const blocked = await analyze(new Request(origin + "/api/analyze", {
+  process.env.OPENAI_BASE_URL = "https://model.example.invalid/v1";
+  let modelCalls = 0;
+  t.mock.method(globalThis, "fetch", async (url: string | URL) => {
+    assert.equal(new URL(url).hostname, "model.example.invalid");
+    modelCalls++;
+    return Response.json({
+      object: "response",
+      status: "completed",
+      output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify(demoAnalysis) }] }],
+    });
+  });
+  const runAnalysis = (credential = cookie) => analyze(new Request(origin + "/api/analyze", {
     method: "POST",
-    headers: { cookie, origin, "Content-Type": "application/json" },
+    headers: { cookie: credential, origin, "Content-Type": "application/json" },
     body: JSON.stringify({ contractText: demoContract }),
   }));
+  const readBalance = (query = "", credential = cookie) =>
+    status(new Request(origin + "/api/billing/status" + query, { headers: { cookie: credential } })).then(res => res.json());
+
+  for (const remaining of [1, 0]) {
+    const analyzed = await runAnalysis();
+    assert.equal(analyzed.status, 200);
+    assert.deepEqual(await analyzed.json(), demoAnalysis);
+    assert.equal((await readBalance()).remaining, remaining);
+  }
+
+  const blocked = await runAnalysis();
   assert.equal(blocked.status, 200);
   assert.equal(blocked.headers.get("cache-control"), "no-store");
   assert.deepEqual(await blocked.json(), {
+    status: "needs_credits",
     code: "NO_CREDITS",
+    remaining: 0,
     message: "You’ve used all your available analyses.",
+    checkout: { endpoint: "/api/billing/checkout", packs: config.packs },
   });
+  assert.equal(modelCalls, 2);
+  const rotated = await status(new Request(origin + "/api/billing/status"));
+  const otherCookie = rotated.headers.get("set-cookie")?.split(";")[0];
+  assert.ok(otherCookie && otherCookie !== cookie);
+  assert.equal((await rotated.json()).remaining, 0);
+  assert.equal((await (await runAnalysis(otherCookie)).json()).code, "NO_CREDITS");
+  assert.equal(modelCalls, 2);
 
   const start = (packId: string, requestOrigin = origin) => checkout(new Request(origin + "/api/billing/checkout", {
     method: "POST", headers: { cookie, origin: requestOrigin, "Content-Type": "application/json" },
@@ -203,15 +272,18 @@ test("checkout uses server pricing and verified webhooks credit only the owning 
   assert.equal((await start("starter", "https://unrelated.example")).status, 403);
   assert.equal((await start("unknown")).status, 400);
   assert.equal(params, undefined);
-  assert.equal((await start("starter")).status, 200);
+  delete process.env.APP_URL;
+  const checkoutResponse = await start("starter");
+  assert.equal(checkoutResponse.status, 200);
+  assert.deepEqual(await checkoutResponse.json(), { url: "https://checkout.stripe.com/test-checkout" });
   const captured = params as Stripe.Checkout.SessionCreateParams | undefined;
   assert.equal(captured?.line_items?.[0].price_data?.unit_amount, 499);
   assert.equal(captured?.client_reference_id, wallet);
   assert.equal(captured?.locale, "en");
-  assert.match(captured?.success_url ?? "", /^http:\/\/localhost:3000\/\?checkout=success/);
+  assert.equal(captured?.success_url, origin + "/?checkout=success&session_id={CHECKOUT_SESSION_ID}");
+  assert.equal(captured?.cancel_url, origin + "/?checkout=canceled");
 
-  const returned = origin + "/api/billing/status?session_id=" + sessionId;
-  const read = async (credential = cookie) => (await status(new Request(returned, { headers: { cookie: credential } }))).json();
+  const read = (credential = cookie) => readBalance("?session_id=" + sessionId, credential);
   assert.deepEqual([(await read()).checkout, (await read()).remaining], ["pending", 0]);
 
   const notify = (type: string, paymentStatus: string, amount: number, validSignature = true) => {
@@ -231,7 +303,7 @@ test("checkout uses server pricing and verified webhooks credit only the owning 
 
   assert.equal((await notify("checkout.session.completed", "paid", 499, false)).status, 400);
   assert.equal((await notify("checkout.session.completed", "unpaid", 499)).status, 200);
-  assert.equal((await notify("checkout.session.completed", "paid", 1)).status, 200);
+  assert.equal((await notify("checkout.session.completed", "paid", 1)).status, 503);
   assert.equal((await read()).remaining, 0);
   const delivered = await Promise.all([
     notify("checkout.session.completed", "paid", 499),
@@ -241,11 +313,13 @@ test("checkout uses server pricing and verified webhooks credit only the owning 
   const paid = await read();
   assert.equal(paid.checkout, "credited");
   assert.equal(paid.remaining, 5);
-  assert.deepEqual([paid.used, paid.purchased], [0, 5]);
-  const anotherCookie = walletCookie(newWallet(), config).split(";")[0];
-  assert.deepEqual([(await read(anotherCookie)).checkout, (await read(anotherCookie)).paid], [null, 0]);
-  const hold = await reserveAnalysis(wallet, network, config);
-  await completeAnalysis(wallet, hold);
+  assert.deepEqual([paid.used, paid.purchased], [2, 5]);
+  const other = await read(otherCookie);
+  assert.deepEqual([other.checkout, other.paid], [null, 0]);
+  const resumed = await runAnalysis();
+  assert.equal(resumed.status, 200);
+  assert.deepEqual(await resumed.json(), demoAnalysis);
+  assert.equal(modelCalls, 3);
   const afterSpend = await read();
-  assert.deepEqual([afterSpend.paid, afterSpend.used, afterSpend.purchased], [4, 1, 5]);
+  assert.deepEqual([afterSpend.paid, afterSpend.used, afterSpend.purchased], [4, 3, 5]);
 });

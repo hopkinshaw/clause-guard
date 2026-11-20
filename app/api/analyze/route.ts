@@ -28,10 +28,11 @@ export async function POST(request: Request) {
   if (!input.success) return Response.json({ error: input.error.issues[0]?.message ?? "Invalid input." }, { status: 400 });
   if (!process.env.OPENAI_API_KEY) return Response.json({ error: "Analysis is not configured yet. Add OPENAI_API_KEY to the server environment. You can still explore the sample report." }, { status: 503 });
 
+  let config: ReturnType<typeof billingConfig> | undefined;
   let wallet: string | null = null;
   let reservation: string | undefined;
   try {
-    const config = billingConfig();
+    config = billingConfig(request);
     const origin = request.headers.get("origin");
     if (origin && origin !== config.app.origin) {
       return Response.json({ error: "Open analysis from the main ClauseGuard site." }, { status: 403 });
@@ -45,8 +46,11 @@ export async function POST(request: Request) {
     if (error instanceof AnalysisLimit) {
       if (error.code === "NO_CREDITS") {
         return Response.json({
+          status: "needs_credits",
           code: "NO_CREDITS",
+          remaining: 0,
           message: "You’ve used all your available analyses.",
+          checkout: config?.checkoutEnabled ? { endpoint: "/api/billing/checkout", packs: config.packs } : null,
         }, { headers: { "Cache-Control": "no-store" } });
       }
       const details = {
@@ -98,6 +102,7 @@ export async function POST(request: Request) {
       }
       const report = verifyReport(response.output_text, input.data.contractText);
       if (report) {
+        if (request.signal.aborted) break;
         try {
           await completeAnalysis(wallet, reservation);
           reservation = undefined;
