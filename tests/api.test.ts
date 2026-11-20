@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { createServer } from "node:http";
 import { POST as analyze } from "../app/api/analyze/route";
+import { verifyReport } from "../app/api/analyze/report";
 import { POST as extract } from "../app/api/extract/route";
 import { demoAnalysis, demoContract } from "../lib/demo";
 import { quotesMatchContract } from "../lib/analysis";
@@ -147,6 +148,25 @@ test("analysis recovers from provider output failures while preserving quote ver
     assert.equal(requests.length, 9);
     assert.equal(replies.length, 0);
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+});
+
+test("duplicate action drafts use strategy-specific fallbacks without replacing a distinct draft", () => {
+  const draft = {
+    ...demoAnalysis,
+    summary: "付款期限需要澄清。",
+    redFlags: [],
+    emailReplies: {
+      politeNegotiation: "您好，请修改付款条款。",
+      upsellPricing: "您好，\n请修改付款条款！",
+      firmDecline: "谢谢您的邀请。按现有条款，我决定婉拒这个项目。",
+    },
+  };
+  const report = verifyReport(JSON.stringify(draft), demoContract, true);
+  assert.ok(report);
+  assert.match(report.emailReplies.politeNegotiation, /书面方式确认.*付款条件/);
+  assert.match(report.emailReplies.upsellPricing, /单独报价.*费用和排期/);
+  assert.equal(report.emailReplies.firmDecline, draft.emailReplies.firmDecline);
+  assert.equal(new Set(Object.values(report.emailReplies)).size, 3);
 });
 
 test("quote matching tolerates whitespace while requiring real excerpts", () => {
