@@ -32,12 +32,14 @@ export function billingConfig(request?: Request) {
     ? JSON.parse(process.env.BILLING_PACKS)
     : [{ id: "starter", credits: 5, amount: 499 }, { id: "plus", credits: 10, amount: 899 }]);
 
+  const stripeKey = process.env.STRIPE_SECRET_KEY?.trim();
+  const sandboxCheckout = /^[sr]k_test_/.test(stripeKey ?? "");
   return {
     app, local, secret, packs,
     free: Math.min(MAX_FREE_ANALYSES, limit("FREE_ANALYSIS_CREDITS", MAX_FREE_ANALYSES, 1000)),
     freeDaily: limit("FREE_ANALYSIS_DAILY_LIMIT", 100, 100_000),
     daily: limit("ANALYSIS_DAILY_LIMIT", 300, 100_000),
-    checkoutEnabled: Boolean(process.env.STRIPE_SECRET_KEY?.trim() && process.env.STRIPE_WEBHOOK_SECRET?.trim()),
+    checkoutEnabled: Boolean(stripeKey && (sandboxCheckout || process.env.STRIPE_WEBHOOK_SECRET?.trim())),
   };
 }
 

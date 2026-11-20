@@ -1,183 +1,262 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowUpRight, CreditCard, RefreshCw } from "lucide-react";
 import type { Pack } from "@/lib/billing/config";
 
 type Balance = {
   remaining: number;
   free: number;
   paid: number;
+  used: number;
+  purchased: number;
   checkout: "pending" | "credited" | null;
+  checkoutCheckFailed: boolean;
+  walletCreated: boolean;
   packs: Pack[];
 };
 
-async function loadBalance(session?: string): Promise<Balance> {
-  const suffix = session ? "?session_id=" + encodeURIComponent(session) : "";
-  const response = await fetch("/api/billing/status" + suffix, { cache: "no-store" });
-  if (!response.ok) throw new Error("Credit balance is unavailable");
+type Payment = "checking" | "credited" | "pending" | "canceled" | "unmatched" | "error";
+type BalanceError = "session" | "checkout" | "unavailable";
+
+const price = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const walletSeenKey = "clauseguard-wallet-seen";
+
+class BalanceRequestError extends Error {
+  constructor(readonly reason: BalanceError) {
+    super(reason);
+  }
+}
+
+async function loadBalance(signal: AbortSignal, session: string | null, requireWallet = false): Promise<Balance> {
+  const params = new URLSearchParams();
+  if (session !== null) params.set("session_id", session);
+  if (requireWallet) params.set("require_wallet", "1");
+  const suffix = params.size ? "?" + params : "";
+  const response = await fetch("/api/billing/status" + suffix, {
+    cache: "no-store",
+    signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+  });
+  if (!response.ok) {
+    const reason = response.status === 428 ? "session" : response.status === 400 && session !== null ? "checkout" : "unavailable";
+    throw new BalanceRequestError(reason);
+  }
   return response.json();
+}
+
+function clearCheckoutUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("checkout");
+  url.searchParams.delete("session_id");
+  window.history.replaceState(window.history.state, "", url);
 }
 
 export function useBilling() {
   const [balance, setBalance] = useState<Balance | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
-  const [payment, setPayment] = useState<"checking" | "credited" | "pending" | "canceled">();
+  const [balanceError, setBalanceError] = useState<BalanceError>();
+  const [walletReplaced, setWalletReplaced] = useState(false);
+  const [payment, setPayment] = useState<Payment>();
   const [buying, setBuying] = useState<string | null>(null);
-  const [checkoutError, setCheckoutError] = useState(false);
-  const [creditNotice, setCreditNotice] = useState("");
+  const [checkoutError, setCheckoutError] = useState("");
+  const request = useRef<AbortController | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const refresh = useCallback(async () => {
-    const session = new URLSearchParams(window.location.search).get("session_id");
-    try {
-      const current = await loadBalance(session ?? undefined);
-      setBalance(current);
-      setUnavailable(false);
-      if (current.checkout === "credited") setPayment("credited");
-    } catch {
-      setUnavailable(true);
-    }
+  const stopRefresh = useCallback(() => {
+    request.current?.abort();
+    clearTimeout(timer.current);
   }, []);
 
-  useEffect(() => {
+  const refresh = useCallback(async () => {
+    stopRefresh();
+    const controller = new AbortController();
+    request.current = controller;
+    const { signal } = controller;
     const params = new URLSearchParams(window.location.search);
     const outcome = params.get("checkout");
-    const session = outcome === "success" ? params.get("session_id") : null;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout>;
+    const session = outcome === "success" ? params.get("session_id") ?? "" : null;
+    const deadline = Date.now() + 30_000;
 
-    function clearCheckoutUrl() {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("checkout");
-      url.searchParams.delete("session_id");
-      window.history.replaceState(window.history.state, "", url);
+    setBalance(null);
+    setBalanceError(undefined);
+    if (outcome === "canceled") {
+      setPayment("canceled");
+      clearCheckoutUrl();
     }
+    if (session !== null) setPayment("checking");
 
-    async function check(attempt: number) {
-      if (session && attempt === 0) setPayment("checking");
-      if (outcome === "canceled") {
-        setPayment("canceled");
-        clearCheckoutUrl();
-      }
+    async function check() {
       try {
-        const current = await loadBalance(session ?? undefined);
-        if (!active) return;
+        let current = await loadBalance(signal, session);
+        const created = current.walletCreated;
+        if (created) current = await loadBalance(signal, null, true);
+        if (signal.aborted) return;
+        try {
+          if (created && localStorage.getItem(walletSeenKey)) setWalletReplaced(true);
+          localStorage.setItem(walletSeenKey, "1");
+        } catch { /* Browsers can disable local storage. The signed cookie still determines the balance. */ }
         setBalance(current);
-        setUnavailable(false);
-        if (!session) return;
+        setBalanceError(undefined);
+        if (session === null) return;
         if (current.checkout === "credited") {
           setPayment("credited");
           clearCheckoutUrl();
-          return;
+        } else if (current.checkout === null) {
+          setPayment("unmatched");
+        } else if (current.checkoutCheckFailed) {
+          setPayment("error");
+        } else if (Date.now() + 2_000 >= deadline) {
+          setPayment("pending");
+        } else {
+          timer.current = setTimeout(() => void check(), 2_000);
         }
-      } catch {
-        if (!active) return;
-        setUnavailable(true);
-      }
-      if (session) {
-        if (attempt < 14) timer = setTimeout(() => void check(attempt + 1), 2000);
-        else setPayment("pending");
+      } catch (error) {
+        if (signal.aborted) return;
+        const reason = error instanceof BalanceRequestError ? error.reason : "unavailable";
+        setBalance(null);
+        setBalanceError(reason);
+        if (session !== null) setPayment(reason === "unavailable" ? "error" : "unmatched");
       }
     }
 
-    void check(0);
+    await check();
+  }, [stopRefresh]);
+
+  useEffect(() => {
+    void refresh();
+    function resume() {
+      if (document.visibilityState === "visible") void refresh();
+    }
     function restore(event: PageTransitionEvent) {
       if (!event.persisted) return;
       setBuying(null);
       void refresh();
     }
+    function suspend() {
+      stopRefresh();
+      setBalance(null);
+      setBalanceError(undefined);
+    }
+    document.addEventListener("visibilitychange", resume);
     window.addEventListener("pageshow", restore);
+    window.addEventListener("pagehide", suspend);
     return () => {
-      active = false;
-      clearTimeout(timer);
+      stopRefresh();
+      document.removeEventListener("visibilitychange", resume);
       window.removeEventListener("pageshow", restore);
+      window.removeEventListener("pagehide", suspend);
     };
-  }, [refresh]);
-
-  function showCreditLimit(message: string, packs: Pack[]) {
-    setCreditNotice(message);
-    setBalance(current => ({
-      ...current,
-      remaining: 0, free: 0, paid: 0,
-      checkout: current?.checkout ?? null,
-      packs,
-    }));
-  }
+  }, [refresh, stopRefresh]);
 
   async function buy(packId: string) {
-    if (buying) return;
+    if (buying || !balance) return;
     setBuying(packId);
-    setCheckoutError(false);
+    setCheckoutError("");
     try {
       const response = await fetch("/api/billing/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ packId }),
+        signal: AbortSignal.timeout(15_000),
       });
+      if (response.status === 428) {
+        setCheckoutError("Your credit session could not be found. Check your balance before trying again.");
+        setBuying(null);
+        void refresh();
+        return;
+      }
       if (!response.ok) throw new Error("Checkout unavailable");
       const { url } = await response.json();
       if (typeof url !== "string") throw new Error("Missing checkout URL");
       window.location.assign(url);
     } catch {
-      setCheckoutError(true);
+      setCheckoutError("Could not open Stripe Checkout. Choose a pack to try again.");
       setBuying(null);
     }
   }
 
-  return { balance, unavailable, payment, buying, checkoutError, creditNotice, setCreditNotice, showCreditLimit, refresh, buy };
+  return { balance, balanceError, walletReplaced, payment, buying, checkoutError, refresh, buy };
 }
 
 export function BillingPanel({
   billing, disabled,
 }: { billing: ReturnType<typeof useBilling>; disabled: boolean }) {
-  const { balance, unavailable, payment, buying, checkoutError, creditNotice, setCreditNotice, refresh, buy } = billing;
-  const showCreditNotice = creditNotice || (!unavailable && balance?.remaining === 0);
-  const price = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+  const { balance, balanceError, walletReplaced, payment, buying, checkoutError, refresh, buy } = billing;
+  const checking = !balance && !balanceError;
+  const exhausted = balance?.remaining === 0;
+  const showPacks = balance?.packs.length && (!payment || payment === "credited" || payment === "canceled");
+  const bestValue = balance?.packs.reduce<Pack | undefined>((best, pack) =>
+    !best || pack.amount / pack.credits < best.amount / best.credits ? pack : best, undefined);
 
-  return <section id="analysis-credits" className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3" aria-label="Analysis credits">
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <strong className="text-sm text-slate-800" aria-live="polite">
-        {balance
-          ? `${balance.remaining} ${balance.remaining === 1 ? "analysis" : "analyses"} remaining`
-          : "Analysis credits"}
-      </strong>
-      <button
-        type="button"
-        onClick={() => { setCreditNotice(""); void refresh(); }}
-        className="text-xs font-medium text-slate-700 underline"
-      >
-        Refresh balance
-      </button>
+  return <section id="analysis-credits" className="mt-5 scroll-mt-6 overflow-hidden rounded-xl border border-slate-300 bg-white" aria-labelledby="analysis-credits-title">
+    <div className={exhausted ? "bg-amber-50 p-4" : "bg-slate-50 p-4"}>
+      <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+        <h2 id="analysis-credits-title" className="text-sm font-semibold text-slate-900" aria-live="polite">
+          {balance
+            ? `${balance.remaining} ${balance.remaining === 1 ? "analysis" : "analyses"} remaining`
+            : checking ? "Checking balance…" : "Analysis credits"}
+        </h2>
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          disabled={checking}
+          className="inline-flex items-center gap-1.5 text-slate-700 underline-offset-2 hover:underline disabled:no-underline"
+        >
+          <RefreshCw size={13} className={checking ? "animate-spin" : ""} aria-hidden="true" />
+          <span className="text-xs font-semibold">Refresh balance</span>
+        </button>
+      </div>
+      {balance && <dl className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-600">
+        {([["Free left", balance.free], ["Paid left", balance.paid], ["Used", balance.used], ["Purchased", balance.purchased]] as const).map(([label, count]) =>
+          <div key={label} className="flex gap-1"><dt>{label}</dt><dd className="font-semibold text-slate-800">{count}</dd></div>,
+        )}
+      </dl>}
+      {exhausted && <p className="mt-2 text-xs leading-relaxed text-amber-950">
+        {payment === "checking" || payment === "pending" || payment === "error"
+          ? "You’re out of analyses. Your balance will update when the payment is confirmed."
+          : balance.packs.length && showPacks
+            ? "You’re out of analyses. Add credits to review another contract."
+            : "You’re out of analyses."}
+      </p>}
+      {balanceError && <p className="mt-2 text-xs leading-relaxed text-red-800" role="alert">{{
+        session: payment === "unmatched"
+          ? "We couldn’t find the credit session for this payment. Open the return link in the browser and on the site you used to pay."
+          : "We couldn’t verify your credit session. Allow cookies for this site, then refresh your balance.",
+        checkout: "This checkout link is incomplete or invalid. Reopen the original return link to check your payment.",
+        unavailable: "We couldn’t load your balance. Refresh your balance to try again.",
+      }[balanceError]}</p>}
+      {walletReplaced && balance && <p className="mt-2 text-xs leading-relaxed text-slate-700" role="status">
+        Your previous credit session was unavailable. This is a new session. To use existing credits, return to the browser and site where you purchased them.
+      </p>}
+      {payment && !(payment === "unmatched" && balanceError) && <p className="mt-2 text-xs leading-relaxed text-slate-700" role="status">{{
+        checking: "Checking your Stripe payment…",
+        credited: "Payment confirmed. Your credits are ready.",
+        pending: "Your payment is still being confirmed. Refresh your balance shortly to check this purchase again.",
+        canceled: "Checkout was canceled.",
+        unmatched: "This purchase doesn’t match the current credit session. Reopen the return link in the browser you used to pay.",
+        error: "We couldn’t confirm this payment right now. Refresh your balance to check the same purchase again.",
+      }[payment]}</p>}
+      {checkoutError && <p className="mt-2 text-xs leading-relaxed text-red-800" role="alert">{checkoutError}</p>}
     </div>
-    {unavailable && <p className="mt-1 text-xs text-slate-600" role="status">Credit balance is unavailable. Please refresh.</p>}
-    {showCreditNotice && <p className="mt-1 text-xs text-slate-700" role="status">
-      {creditNotice || "You’ve used all your available analyses."}{" "}
-      {balance?.packs.length
-        ? "Choose a credit pack below to keep going."
-        : "Purchases are currently unavailable. Please check back later."}
-    </p>}
-    {balance && !unavailable && !showCreditNotice && <p className="mt-1 text-xs text-slate-600">
-      {balance.free} free · {balance.paid} purchased
-    </p>}
-    {payment && <p className="mt-2 text-xs text-slate-700" role="status">{{
-      checking: "Checking your Stripe payment…",
-      credited: "Payment confirmed. Your credits are ready.",
-      pending: "Payment is still being confirmed. Refresh your balance in this browser shortly.",
-      canceled: "Checkout was canceled.",
-    }[payment]}</p>}
-    {Boolean(balance?.packs.length) && <>
-      <div className="mt-3 flex flex-wrap gap-2">
-        {balance?.packs.map(pack => <button
+    {showPacks ? <div className="border-t border-slate-200 bg-teal-50/50 p-4">
+      <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900"><CreditCard size={16} aria-hidden="true" /> Add analysis credits</h3>
+      <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,8.5rem),1fr))] gap-2.5">
+        {balance.packs.map(pack => <button
           key={pack.id}
           type="button"
           onClick={() => void buy(pack.id)}
           disabled={disabled || Boolean(buying)}
-          className="rounded border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700"
+          className={`rounded-lg border p-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 ${exhausted && pack === bestValue
+            ? "border-teal-900 bg-teal-900 text-white enabled:hover:bg-teal-800"
+            : "border-teal-600 bg-white text-teal-950 enabled:hover:border-teal-800 enabled:hover:bg-teal-50"}`}
         >
-          {buying === pack.id
-            ? "Opening Stripe…"
-            : `Buy ${pack.credits} credits · ${price.format(pack.amount / 100)}`}
+          <span className="flex items-center justify-between gap-1 text-xs font-semibold">
+            {buying === pack.id ? "Opening Stripe…" : `Buy ${pack.credits} credits`}
+            <ArrowUpRight size={14} className="shrink-0" aria-hidden="true" />
+          </span>
+          <span className="mt-1.5 block text-lg font-semibold tabular-nums">{price.format(pack.amount / 100)}</span>
+          <span className="block text-xs opacity-85">{price.format(pack.amount / pack.credits / 100)} per analysis</span>
         </button>)}
       </div>
-      <p className="mt-2 text-xs text-slate-600">Checkout opens in Stripe. Credits are tied to this browser’s cookies.</p>
-    </>}
-    {checkoutError && <p className="mt-2 text-xs text-red-700" role="alert">Could not open checkout. Please try again.</p>}
+      <p className="mt-2.5 text-xs leading-relaxed text-slate-600">Pay with Stripe. Credits stay with this browser on this site.</p>
+    </div> : balance && exhausted && !balance.packs.length && !payment &&
+      <p className="border-t border-slate-200 p-4 text-xs text-slate-700">Purchases are temporarily unavailable. Refresh your balance to check again.</p>}
   </section>;
 }

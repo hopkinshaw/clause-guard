@@ -72,27 +72,47 @@ export default function Home() {
     setReport(demoAnalysis); setIsDemo(true);
   }
   async function analyze(event: React.FormEvent) {
-    event.preventDefault(); setBusy(true); setError("");
-    billing.setCreditNotice("");
+    event.preventDefault();
+    if (busy || extracting || text.trim().length < 80) return;
+    if (!billing.balance?.remaining) {
+      document.getElementById("analysis-credits")?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    setBusy(true); setError("");
     try {
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contractText: text, role, pricing, clientContext: context }),
+        signal: AbortSignal.timeout(100_000),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Analysis failed. Please try again.");
-      if (data.status === "needs_credits" && data.code === "NO_CREDITS") {
-        billing.showCreditLimit(data.message, data.checkout?.packs ?? []);
+      const data = await res.json().catch(() => null);
+      if (data?.status === "needs_credits" && data.code === "NO_CREDITS") {
         document.getElementById("analysis-credits")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
         return;
       }
-      setReport(analysisSchema.parse(data)); setIsDemo(false);
+      if (!res.ok) {
+        setError(res.status === 428
+          ? "Your credit session could not be found. Check your balance before trying again."
+          : res.status === 504
+            ? "Analysis timed out. Your contract is still here. Please try again."
+            : typeof data?.error === "string" ? data.error : "Analysis is temporarily unavailable. Please try again.");
+        return;
+      }
+      const result = analysisSchema.safeParse(data);
+      if (!result.success) {
+        setError("The analysis could not be read. Please try again.");
+        return;
+      }
+      setReport(result.data); setIsDemo(false);
       results.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    } catch (err) { setError(err instanceof Error ? err.message : "Connection failed. Please try again."); }
-    finally {
+    } catch (err) {
+      setError(err instanceof DOMException && err.name === "TimeoutError"
+        ? "Analysis timed out. Your contract is still here. Please try again."
+        : "Could not reach the analysis service. Check your connection and try again.");
+    } finally {
+      await billing.refresh();
       setBusy(false);
-      void billing.refresh();
     }
   }
 
@@ -116,7 +136,7 @@ export default function Home() {
           <div className="context-heading"><BriefcaseBusiness size={16} /><h3>Add some context</h3><span>OPTIONAL</span></div>
           <fieldset disabled={busy || extracting} className="context-fields"><div className="two-fields"><div><label htmlFor="role">Your role</label><div className="select-wrap"><select id="role" value={role} onChange={e => setRole(e.target.value)}><option value="">Select your role</option><option>Designer</option><option>Video Editor</option><option>Developer</option><option>Writer</option><option>Consultant</option><option>Other freelancer</option></select><ChevronDown size={14} /></div></div><div><label htmlFor="pricing">Project rate</label><input id="pricing" placeholder="e.g. $40/hr" value={pricing} onChange={e => setPricing(e.target.value)} maxLength={120} /></div></div><label htmlFor="context">Anything we should know?</label><textarea id="context" className="context-text" placeholder={'e.g. “They said it’s just a standard NDA.”'} value={context} onChange={e => setContext(e.target.value)} maxLength={1000} /></fieldset>
           {error && <div className="error-message" role="alert"><AlertTriangle size={17} /><span>{error}</span></div>}
-          <button className="analyze-button" type="submit" disabled={busy || extracting || billing.unavailable || !billing.balance?.remaining || text.trim().length < 80}>{busy ? <LoaderCircle size={18} className="animate-spin" /> : <ScanLine size={19} />}{busy ? "Reviewing the fine print…" : "Analyze my contract"}</button>
+          <button className="analyze-button" type="submit" disabled={busy || extracting || !billing.balance?.remaining || text.trim().length < 80}>{busy ? <LoaderCircle size={18} className="animate-spin" /> : <ScanLine size={19} />}{busy ? "Reviewing the fine print…" : "Analyze my contract"}</button>
           <p className="privacy-note"><LockKeyhole size={12} /> We analyze your contract only when you click Analyze my contract. We don’t store the contract text.</p>
           <BillingPanel billing={billing} disabled={busy || extracting} />
         </form></aside>

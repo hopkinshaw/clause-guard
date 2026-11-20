@@ -220,6 +220,7 @@ test("two analyses, quota block, and verified Stripe payment restore credits on 
   assert.equal(initial.status, 200);
   const fresh = await initial.json();
   assert.deepEqual([fresh.remaining, fresh.used, fresh.purchased], [2, 0, 0]);
+  assert.equal(fresh.walletCreated, true);
   assert.ok(Number.isFinite(Date.parse(fresh.updatedAt)));
   const signed = initial.headers.get("set-cookie");
   assert.ok(signed && signed.includes("HttpOnly"));
@@ -227,6 +228,10 @@ test("two analyses, quota block, and verified Stripe payment restore credits on 
   const config = billingConfig();
   const wallet = walletFromRequest(new Request(origin, { headers: { cookie } }), config);
   assert.ok(wallet);
+  const confirmed = await status(new Request(origin + "/api/billing/status?require_wallet=1", { headers: { cookie } }));
+  assert.equal(confirmed.status, 200);
+  assert.equal(confirmed.headers.get("set-cookie"), null);
+  assert.equal((await confirmed.json()).walletCreated, false);
   process.env.OPENAI_API_KEY = randomBytes(16).toString("hex");
   process.env.OPENAI_BASE_URL = "https://model.example.invalid/v1";
   let modelCalls = 0;
@@ -299,6 +304,10 @@ test("two analyses, quota block, and verified Stripe payment restore credits on 
   assert.equal(captured?.success_url, origin + "/?checkout=success&session_id={CHECKOUT_SESSION_ID}");
   assert.equal(captured?.cancel_url, origin + "/?checkout=canceled");
 
+  t.mock.method(stripe.checkout.sessions, "retrieve", async (id: string) => ({
+    id, mode: "payment", currency: "usd", amount_total: 499,
+    payment_status: "unpaid", client_reference_id: wallet, metadata: captured?.metadata,
+  }));
   const read = (credential = cookie) => readBalance("?session_id=" + sessionId, credential);
   assert.deepEqual([(await read()).checkout, (await read()).remaining], ["pending", 0]);
 
@@ -373,4 +382,89 @@ test("two analyses, quota block, and verified Stripe payment restore credits on 
   } finally {
     await ledger.end();
   }
+});
+
+test("checkout return credits only its browser wallet and reconciles once without a webhook", { skip: !testDatabase }, async t => {
+  const originalSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  t.after(() => {
+    if (originalSecret === undefined) delete process.env.STRIPE_WEBHOOK_SECRET;
+    else process.env.STRIPE_WEBHOOK_SECRET = originalSecret;
+  });
+  delete process.env.STRIPE_WEBHOOK_SECRET;
+  const config = billingConfig(new Request(origin));
+  assert.equal(config.checkoutEnabled, true);
+  const wallet = newWallet();
+  const otherWallet = newWallet();
+  const sessionId = "cs_test_" + randomBytes(10).toString("hex");
+  const pack = config.packs[0];
+  await savePurchase(sessionId, wallet, pack);
+
+  const stripe = stripeClient();
+  const session = {
+    id: sessionId, currency: "usd", mode: "payment", payment_status: "paid",
+    amount_total: pack.amount, client_reference_id: wallet,
+    metadata: { product: "clauseguard_credits", pack: pack.id, wallet },
+  };
+  let stripeResponse = { ...session, payment_status: "unpaid" };
+  let stripeAvailable = true;
+  const retrieve = t.mock.method(stripe.checkout.sessions, "retrieve", async (id: string) => {
+    assert.equal(id, sessionId);
+    if (!stripeAvailable) throw new Error("Stripe is temporarily unavailable");
+    return stripeResponse;
+  });
+  const signedCookie = (id: string) => walletCookie(id, config).split(";", 1)[0];
+  const read = async (cookie?: string, query = sessionId) => {
+    const response = await status(new Request(origin + "/api/billing/status?session_id=" + query, {
+      headers: cookie ? { cookie } : {},
+    }));
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+
+  for (const query of ["session_id=" + sessionId, "require_wallet=1"]) {
+    const missing = await status(new Request(origin + "/api/billing/status?" + query));
+    assert.equal(missing.status, 428);
+    assert.equal(missing.headers.get("set-cookie"), null);
+    assert.equal((await missing.json()).code, "BILLING_SESSION_REQUIRED");
+  }
+  assert.equal((await read(signedCookie(otherWallet))).checkout, null);
+  const cookie = signedCookie(wallet);
+  assert.equal((await read(cookie, "cs_test_unrecognized")).checkout, null);
+  assert.equal(retrieve.mock.callCount(), 0);
+
+  const state = async () => {
+    const balance = await read(cookie);
+    return [balance.checkout, balance.paid, balance.purchased];
+  };
+  assert.deepEqual(await state(), ["pending", 0, 0]);
+  assert.equal((await read(cookie)).checkoutCheckFailed, false);
+  stripeAvailable = false;
+  const failed = await read(cookie);
+  assert.deepEqual([failed.checkout, failed.paid, failed.purchased, failed.checkoutCheckFailed], ["pending", 0, 0, true]);
+  stripeAvailable = true;
+  stripeResponse = { ...session, amount_total: pack.amount + 1 };
+  assert.deepEqual(await state(), ["pending", 0, 0]);
+  stripeResponse = {
+    ...session, client_reference_id: otherWallet,
+    metadata: { ...session.metadata, wallet: otherWallet },
+  };
+  assert.deepEqual(await state(), ["pending", 0, 0]);
+
+  stripeResponse = session;
+  const expected = ["credited", pack.credits, pack.credits];
+  assert.deepEqual(await Promise.all([state(), state()]), [expected, expected]);
+  const lookupCount = retrieve.mock.callCount();
+  assert.deepEqual(await state(), expected);
+  assert.equal(retrieve.mock.callCount(), lookupCount);
+
+  // A delayed, valid webhook must also leave the balance unchanged.
+  const webhookSecret = "whsec_" + randomBytes(16).toString("hex");
+  process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
+  const payload = JSON.stringify({ type: "checkout.session.completed", data: { object: session } });
+  const signature = stripe.webhooks.generateTestHeaderString({ payload, secret: webhookSecret });
+  const delivery = await webhook(new Request(origin + "/api/billing/webhook", {
+    method: "POST", body: payload, headers: { "stripe-signature": signature },
+  }));
+  assert.equal(delivery.status, 200);
+  assert.deepEqual(await state(), expected);
 });

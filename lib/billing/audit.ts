@@ -10,7 +10,7 @@ export function billingErrorCode(error: unknown) {
   return typeof code === "string" && /^(?:[A-Z0-9]{5}|E[A-Z_]{3,20})$/.test(code) ? code : null;
 }
 
-export function billingAudit(route: "analyze" | "status") {
+export function billingAudit(route: "analyze" | "status" | "webhook") {
   const requestId = randomUUID();
   const revision = process.env.VERCEL_GIT_COMMIT_SHA;
   const context = {

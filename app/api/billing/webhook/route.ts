@@ -1,7 +1,6 @@
 import type Stripe from "stripe";
-import { checkoutSessionPattern, walletPattern } from "@/lib/billing/identity";
-import { creditPurchase } from "@/lib/billing/store";
-import { stripeClient } from "@/lib/billing/stripe";
+import { billingAudit, billingErrorCode, billingRef } from "@/lib/billing/audit";
+import { fulfillCheckout, stripeClient } from "@/lib/billing/stripe";
 
 export const runtime = "nodejs";
 
@@ -19,20 +18,19 @@ export async function POST(request: Request) {
   }
 
   if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+    const audit = billingAudit("webhook");
     const session = event.data.object;
-    const metadata = session.metadata;
-    if (session.mode === "payment" && session.payment_status === "paid" && session.currency === "usd" &&
-        session.amount_total !== null && Number.isSafeInteger(session.amount_total) &&
-        metadata?.product === "clauseguard_credits" && metadata.pack && metadata.wallet &&
-        metadata.wallet === session.client_reference_id && walletPattern.test(metadata.wallet) &&
-        checkoutSessionPattern.test(session.id)) {
-      try {
-        // The database verifies the checkout snapshot and credits each session at most once.
-        const confirmed = await creditPurchase(session.id, metadata.wallet, metadata.pack, session.amount_total);
-        if (!confirmed) return new Response("Checkout record could not be confirmed", { status: 503 });
-      } catch {
-        return new Response("Could not credit purchase", { status: 503 });
+    const refs = { sessionRef: billingRef(session.id), event: event.type };
+    try {
+      const fulfilled = await fulfillCheckout(session);
+      if (fulfilled === false) {
+        audit.log("warn", "checkout_record_mismatch", refs);
+        return new Response("Checkout record could not be confirmed", { status: 503 });
       }
+      if (fulfilled) audit.log("info", "checkout_confirmed", refs);
+    } catch (error) {
+      audit.log("error", "checkout_confirmation_failed", { ...refs, errorCode: billingErrorCode(error) });
+      return new Response("Could not credit purchase", { status: 503 });
     }
   }
   return Response.json({ received: true });
